@@ -1,1093 +1,1448 @@
 --[[
-    AI Script v0.02
-    - Page-based UI (Main / Ore Farm)
-    - Mine ore near rocks with platform under player
-    - INSIDE ROCK mode toggle (TP inside rock, camera on rock)
-    - Detect broken rock by ore in Backpack
-    - TP to NPC for selling
-    - Fly (IY style), Noclip (IY style)
-    - Anti-AFK auto on farm start
-    - Stats: time, money, $/hour
-    - NO FALL DAMAGE toggle
+    AI Script v0.01
+    Game: UGC Prison (Place ID: 102718061120016)
+    Features: Ore Farm, Fly, Noclip, No Fall DMG, Anti-AFK
 ]]
 
+--// SERVICES
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
 local VirtualUser = game:GetService("VirtualUser")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
 
+--// PLAYER
 local LocalPlayer = Players.LocalPlayer
 local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
 local Humanoid = Character:WaitForChild("Humanoid")
-local RootPart = Character:WaitForChild("HumanoidRootPart")
+local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
 
--- ═══════════════ SETTINGS ═══════════════
+--// CONSTANTS
 local CAVE_POS = Vector3.new(-424, -8, 246)
-local NPC_NAME = "Mineral Buyer"
-local ORE_PRICES = {Azurith=54, RawGold=24, RawIron=11, RawCopper=5, Coal=4}
-local ORE_NAMES = {"Azurith","RawGold","RawIron","RawCopper","Coal"}
-local HIT_COOLDOWN = 0.35
-local MINE_DISTANCE = 5
-local ROCKS_FOLDER_PATH = "Tasks.Prisoner.Rocks"
+local ROCKS_PARENT_PATH = "Tasks.Prisoner.Rocks"
+local MINERAL_BUYER_NAME = "Mineral Buyer"
+local MINING_DISTANCE = 5
+local HIT_INTERVAL = 0.45
+local SELL_INTERVAL = 2
 
--- ═══════════════ STATE ═══════════════
-local farming = false
-local flying = false
-local noclipping = false
-local noclipConn = nil
-local flyConn = nil
-local flyDirection = {f=0, b=0, l=0, r=0, u=0, d=0}
-local antiAfkConn = nil
-local insideRockMode = false
+--// Ore Prices
+local ORE_PRICES = {
+    Azurith = 54,
+    RawGold = 24,
+    RawIron = 11,
+    RawCopper = 5,
+    Coal = 4
+}
 
--- No Fall Damage state
-local dmgBlocked = false
-local noDmgConn = nil
-
--- Platform
-local platform = nil
-local platformConn = nil
-
--- Stats
+--// STATE
+local isFlying = false
+local isNoclipping = false
+local isNoFallDmg = false
+local isFarming = false
 local farmStartTime = 0
-local totalMoneyEarned = 0
-local frozenElapsed = 0
+local frozenTimeStr = "00:00:00"
+local frozenOreCount = 0
+local frozenEarnings = 0
+local totalOreMined = 0
+local totalEarnings = 0
+local currentSessionOre = 0
+local currentSessionEarnings = 0
+local minedRocks = {}
+local lastRockPosition = nil
 
--- ═══════════════ UTILITY ═══════════════
+--// Fly State (IY-style)
+local flySpeed = 80
+local flyBodyVelocity = nil
+local flyBodyGyro = nil
+local flyConn = nil
+local noclipConn = nil
+local noFallConn = nil
+local platformPart = nil
+
+--// Anti-AFK
+local antiAFKConn = nil
+
+--// ============================================================
+--// UTILITY FUNCTIONS
+--// ============================================================
+
 local function getCharacter()
     local char = LocalPlayer.Character
-    if char and char:FindFirstChild("HumanoidRootPart") and char:FindFirstChild("Humanoid") and char.Humanoid.Health > 0 then
+    if char and char:FindFirstChild("HumanoidRootPart") and char:FindFirstChild("Humanoid") then
         return char
     end
     return nil
 end
 
-local function getRootPart()
+local function getHRP()
     local char = getCharacter()
     return char and char:FindFirstChild("HumanoidRootPart")
 end
 
-local function getBackpack()
-    return LocalPlayer:FindFirstChild("Backpack")
-end
-
-local function countOre()
-    local bp = getBackpack()
+local function getHumanoid()
     local char = getCharacter()
-    local count = 0
-    if bp then
-        for _, item in pairs(bp:GetChildren()) do
-            if table.find(ORE_NAMES, item.Name) then
-                count = count + 1
-            end
-        end
-    end
-    if char then
-        for _, item in pairs(char:GetChildren()) do
-            if table.find(ORE_NAMES, item.Name) then
-                count = count + 1
-            end
-        end
-    end
-    return count
+    return char and char:FindFirstChildOfClass("Humanoid")
 end
 
-local function getRocksFolder()
-    local t = workspace:FindFirstChild("Tasks")
-    if not t then return nil end
-    local p = t:FindFirstChild("Prisoner")
-    if not p then return nil end
-    return p:FindFirstChild("Rocks")
+local function getToolEvent()
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    if not remotes then return nil end
+    local toolFolder = remotes:FindFirstChild("Tool")
+    if not toolFolder then return nil end
+    return toolFolder:FindFirstChild("Event")
+end
+
+local function getSellRemote()
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    if not remotes then return nil end
+    return remotes:FindFirstChild("SellOre")
+end
+
+local function getMineralBuyer()
+    local entities = Workspace:FindFirstChild("Entities")
+    if not entities then return nil end
+    return entities:FindFirstChild(MINERAL_BUYER_NAME)
+end
+
+local function getRocksParent()
+    local tasks = Workspace:FindFirstChild("Tasks")
+    if not tasks then return nil end
+    local prisoner = tasks:FindFirstChild("Prisoner")
+    if not prisoner then return nil end
+    return prisoner:FindFirstChild("Rocks")
+end
+
+local function countInventoryItems()
+    local char = getCharacter()
+    if not char then return {} end
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    local counts = {}
+    for oreName, _ in pairs(ORE_PRICES) do
+        counts[oreName] = 0
+    end
+    -- Check Backpack
+    if backpack then
+        for _, item in ipairs(backpack:GetChildren()) do
+            if ORE_PRICES[item.Name] then
+                counts[item.Name] = counts[item.Name] + 1
+            end
+        end
+    end
+    -- Check Character (held items)
+    if char then
+        for _, item in ipairs(char:GetChildren()) do
+            if ORE_PRICES[item.Name] then
+                counts[item.Name] = counts[item.Name] + 1
+            end
+        end
+    end
+    return counts
+end
+
+local function getTotalOreCount(inventory)
+    local total = 0
+    for _, count in pairs(inventory) do
+        total = total + count
+    end
+    return total
+end
+
+local function calculateEarnings(inventory)
+    local total = 0
+    for oreName, count in pairs(inventory) do
+        if ORE_PRICES[oreName] then
+            total = total + (count * ORE_PRICES[oreName])
+        end
+    end
+    return total
+end
+
+local function formatTime(seconds)
+    local h = math.floor(seconds / 3600)
+    local m = math.floor((seconds % 3600) / 60)
+    local s = math.floor(seconds % 60)
+    return string.format("%02d:%02d:%02d", h, m, s)
+end
+
+local function isRockValid(rock)
+    if not rock then return false end
+    if rock.Parent == nil then return false end
+    if not Workspace:IsAncestorOf(rock) then return false end
+    if not rock:IsA("BasePart") then return false end
+    return true
 end
 
 local function findNearestRock(skipList)
-    local rocks = getRocksFolder()
-    local root = getRootPart()
-    if not rocks or not root then return nil end
-    
+    skipList = skipList or {}
+    local rocksParent = getRocksParent()
+    if not rocksParent then return nil end
+
+    local hrp = getHRP()
+    if not hrp then return nil end
+
     local nearest = nil
     local nearestDist = math.huge
-    
-    for _, rock in pairs(rocks:GetChildren()) do
-        if rock:IsA("BasePart") then
-            if skipList and skipList[rock] then
-                continue
+
+    for _, rock in ipairs(rocksParent:GetChildren()) do
+        if isRockValid(rock) then
+            -- Skip already mined rocks
+            local skip = false
+            for _, skipped in ipairs(skipList) do
+                if skipped == rock then
+                    skip = true
+                    break
+                end
             end
-            local dist = (rock.Position - root.Position).Magnitude
-            if dist < nearestDist then
-                nearestDist = dist
-                nearest = rock
+            if not skip then
+                local dist = (rock.Position - hrp.Position).Magnitude
+                if dist < nearestDist then
+                    nearestDist = dist
+                    nearest = rock
+                end
             end
         end
     end
-    return nearest
+
+    return nearest, nearestDist
 end
 
-local function getNPCPart()
-    local entities = workspace:FindFirstChild("Entities")
-    if not entities then return nil end
-    local npc = entities:FindFirstChild(NPC_NAME)
-    if not npc then return nil end
-    return npc:FindFirstChild("HumanoidRootPart") or npc:FindFirstChild("Torso") or npc:FindFirstChild("Head")
-end
+--// ============================================================
+--// PLATFORM (anti-fall while mining)
+--// ============================================================
 
-local function getPickaxe()
-    local char = getCharacter()
-    if char then
-        local pick = char:FindFirstChild("Pickaxe")
-        if pick then return pick end
+local function removePlatform()
+    if platformPart then
+        pcall(function() platformPart:Destroy() end)
+        platformPart = nil
     end
-    local bp = getBackpack()
-    if bp then
-        local pick = bp:FindFirstChild("Pickaxe")
-        if pick then return pick end
-    end
-    return nil
 end
 
--- ═══════════════ ANTI-AFK ═══════════════
-local function enableAntiAfk()
-    if antiAfkConn then return end
-    antiAfkConn = LocalPlayer.Idled:Connect(function()
+local function movePlatformTo(position)
+    if platformPart and platformPart.Parent then
+        platformPart.Position = position - Vector3.new(0, 3.5, 0)
+    end
+end
+
+local function createPlatform(position)
+    removePlatform()
+    local success = pcall(function()
+        platformPart = Instance.new("Part")
+        platformPart.Name = "AIPlatform"
+        platformPart.Size = Vector3.new(12, 1, 12)
+        platformPart.Position = position - Vector3.new(0, 3.5, 0)
+        platformPart.Anchored = true
+        platformPart.CanCollide = true
+        platformPart.Material = Enum.Material.ForceField
+        platformPart.Transparency = 0.5
+        platformPart.BrickColor = BrickColor.new("Cyan")
+        platformPart.Parent = Workspace
+    end)
+    if not success then
+        platformPart = nil
+    end
+end
+
+--// ============================================================
+--// ANTI-AFK
+--// ============================================================
+
+local function startAntiAFK()
+    if antiAFKConn then return end
+    antiAFKConn = LocalPlayer.Idled:Connect(function()
         VirtualUser:CaptureController()
         VirtualUser:ClickButton2(Vector2.new())
     end)
 end
 
-local function disableAntiAfk()
-    if antiAfkConn then
-        antiAfkConn:Disconnect()
-        antiAfkConn = nil
-    end
-end
+--// ============================================================
+--// NO FALL DAMAGE
+--// ============================================================
 
--- ═══════════════ NO FALL DAMAGE ═══════════════
-local function enableDmgBlock()
-    if dmgBlocked then return end
-    dmgBlocked = true
-    noDmgConn = RunService.Heartbeat:Connect(function()
-        local char = getCharacter()
-        if char then
-            local hum = char:FindFirstChild("Humanoid")
+local function toggleNoFallDMG(enable)
+    if enable then
+        if noFallConn then noFallConn:Disconnect() end
+        noFallConn = RunService.Heartbeat:Connect(function()
+            local hum = getHumanoid()
             if hum and hum.Health < hum.MaxHealth then
                 hum.Health = hum.MaxHealth
             end
+        end)
+        isNoFallDmg = true
+    else
+        if noFallConn then
+            noFallConn:Disconnect()
+            noFallConn = nil
         end
-    end)
-end
-
-local function disableDmgBlock()
-    if not dmgBlocked then return end
-    dmgBlocked = false
-    if noDmgConn then
-        noDmgConn:Disconnect()
-        noDmgConn = nil
+        isNoFallDmg = false
     end
 end
 
--- ═══════════════ PLATFORM ═══════════════
-local function createPlatform(pos)
-    if platform then platform:Destroy() end
-    platform = Instance.new("Part")
-    platform.Name = "AIScriptPlatform"
-    platform.Size = Vector3.new(12, 1, 12)
-    platform.Position = pos - Vector3.new(0, 4, 0)
-    platform.Anchored = true
-    platform.Transparency = 0.6
-    platform.Material = Enum.Material.ForceField
-    platform.BrickColor = BrickColor.new("Cyan")
-    platform.CanCollide = true
-    platform.Parent = workspace
-end
+--// ============================================================
+--// NOCLIP (IY-style)
+--// ============================================================
 
-local function removePlatform()
-    if platform then
-        platform:Destroy()
-        platform = nil
-    end
-    if platformConn then
-        platformConn:Disconnect()
-        platformConn = nil
-    end
-end
-
-local function startPlatformFollow(rockRef)
-    if platformConn then platformConn:Disconnect() end
-    platformConn = RunService.Heartbeat:Connect(function()
-        local root = getRootPart()
-        if not root or not farming then
-            removePlatform()
-            return
+local function toggleNoclip(enable)
+    if enable then
+        if noclipConn then noclipConn:Disconnect() end
+        noclipConn = RunService.Stepped:Connect(function()
+            local char = getCharacter()
+            if char then
+                for _, part in ipairs(char:GetDescendants()) do
+                    if part:IsA("BasePart") then
+                        part.CanCollide = false
+                    end
+                end
+            end
+        end)
+        isNoclipping = true
+    else
+        if noclipConn then
+            noclipConn:Disconnect()
+            noclipConn = nil
         end
-        if platform and platform.Parent then
-            -- Keep platform under the player
-            platform.CFrame = CFrame.new(root.Position - Vector3.new(0, 4, 0))
-        end
-    end)
-end
-
--- ═══════════════ NOCLIP (IY style) ═══════════════
-local function startNoclip()
-    if noclipConn then return end
-    noclipping = true
-    noclipConn = RunService.Stepped:Connect(function()
-        if not noclipping then return end
+        -- Restore collisions
         local char = getCharacter()
         if char then
-            for _, child in pairs(char:GetDescendants()) do
-                if child:IsA("BasePart") and child.CanCollide == true then
-                    child.CanCollide = false
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = true
                 end
             end
         end
-    end)
-end
-
-local function stopNoclip()
-    noclipping = false
-    if noclipConn then
-        noclipConn:Disconnect()
-        noclipConn = nil
+        isNoclipping = false
     end
 end
 
--- ═══════════════ FLY (IY style) ═══════════════
-local flyspeed = 1
-local FLYING = false
-local flyKeyDown = nil
-local flyKeyUp = nil
-local BV = nil
-local BG = nil
-
-local function IY_FLY()
-    FLYING = true
-    local root = getRootPart()
-    if not root then return end
-    local humanoid = getCharacter() and getCharacter():FindFirstChildOfClass("Humanoid")
-    
-    local CONTROL = {F = 0, B = 0, L = 0, R = 0, Q = 0, E = 0}
-    local lCONTROL = {F = 0, B = 0, L = 0, R = 0, Q = 0, E = 0}
-    local SPEED = 0
-    
-    BG = Instance.new('BodyGyro')
-    BV = Instance.new('BodyVelocity')
-    BG.P = 9e4
-    BG.Parent = root
-    BV.Parent = root
-    BG.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
-    BG.CFrame = root.CFrame
-    BV.Velocity = Vector3.new(0, 0, 0)
-    BV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
-    
-    if humanoid then humanoid.PlatformStand = true end
-    
-    flyKeyDown = UserInputService.InputBegan:Connect(function(input, processed)
-        if processed then return end
-        if input.KeyCode == Enum.KeyCode.W then CONTROL.F = flyspeed
-        elseif input.KeyCode == Enum.KeyCode.S then CONTROL.B = -flyspeed
-        elseif input.KeyCode == Enum.KeyCode.A then CONTROL.L = -flyspeed
-        elseif input.KeyCode == Enum.KeyCode.D then CONTROL.R = flyspeed
-        elseif input.KeyCode == Enum.KeyCode.E then CONTROL.Q = flyspeed * 2
-        elseif input.KeyCode == Enum.KeyCode.Q then CONTROL.E = -flyspeed * 2
-        end
-    end)
-    
-    flyKeyUp = UserInputService.InputEnded:Connect(function(input, processed)
-        if processed then return end
-        if input.KeyCode == Enum.KeyCode.W then CONTROL.F = 0
-        elseif input.KeyCode == Enum.KeyCode.S then CONTROL.B = 0
-        elseif input.KeyCode == Enum.KeyCode.A then CONTROL.L = 0
-        elseif input.KeyCode == Enum.KeyCode.D then CONTROL.R = 0
-        elseif input.KeyCode == Enum.KeyCode.E then CONTROL.Q = 0
-        elseif input.KeyCode == Enum.KeyCode.Q then CONTROL.E = 0
-        end
-    end)
-    
-    task.spawn(function()
-        repeat task.wait()
-            local camera = workspace.CurrentCamera
-            if CONTROL.L + CONTROL.R ~= 0 or CONTROL.F + CONTROL.B ~= 0 or CONTROL.Q + CONTROL.E ~= 0 then
-                SPEED = 50
-            else
-                SPEED = 0
-            end
-            if (CONTROL.L + CONTROL.R) ~= 0 or (CONTROL.F + CONTROL.B) ~= 0 or (CONTROL.Q + CONTROL.E) ~= 0 then
-                BV.Velocity = ((camera.CFrame.LookVector * (CONTROL.F + CONTROL.B)) + ((camera.CFrame * CFrame.new(CONTROL.L + CONTROL.R, (CONTROL.F + CONTROL.B + CONTROL.Q + CONTROL.E) * 0.2, 0).p) - camera.CFrame.p)) * SPEED
-                lCONTROL = {F = CONTROL.F, B = CONTROL.B, L = CONTROL.L, R = CONTROL.R}
-            elseif (CONTROL.L + CONTROL.R) == 0 and (CONTROL.F + CONTROL.B) == 0 and (CONTROL.Q + CONTROL.E) == 0 and SPEED ~= 0 then
-                BV.Velocity = ((camera.CFrame.LookVector * (lCONTROL.F + lCONTROL.B)) + ((camera.CFrame * CFrame.new(lCONTROL.L + lCONTROL.R, (lCONTROL.F + lCONTROL.B + CONTROL.Q + CONTROL.E) * 0.2, 0).p) - camera.CFrame.p)) * SPEED
-            else
-                BV.Velocity = Vector3.new(0, 0, 0)
-            end
-            BG.CFrame = camera.CFrame
-        until not FLYING
-        
-        if BG then BG:Destroy() BG = nil end
-        if BV then BV:Destroy() BV = nil end
-        local hum = getCharacter() and getCharacter():FindFirstChildOfClass("Humanoid")
-        if hum then hum.PlatformStand = false end
-    end)
-end
-
-local function IY_NOFLY()
-    FLYING = false
-    if flyKeyDown then flyKeyDown:Disconnect() flyKeyDown = nil end
-    if flyKeyUp then flyKeyUp:Disconnect() flyKeyUp = nil end
-    local hum = getCharacter() and getCharacter():FindFirstChildOfClass("Humanoid")
-    if hum then hum.PlatformStand = false end
-    if BG then BG:Destroy() BG = nil end
-    if BV then BV:Destroy() BV = nil end
-end
+--// ============================================================
+--// FLY (Infinite Yield style - BodyGyro/BodyVelocity + CFrame fallback)
+--// ============================================================
 
 local function startFly()
-    if flying then return end
-    flying = true
-    local ok, err = pcall(function() IY_FLY() end)
-    if not ok then
-        warn("[FLY] BodyGyro failed, CFrame fallback: " .. tostring(err))
-        IY_NOFLY()
-        flying = true
-        flyDirection = {f=0, b=0, l=0, r=0, u=0, d=0}
-        flyConn = RunService.RenderStepped:Connect(function()
-            local root = getRootPart()
-            if not root or not flying then return end
-            local cam = workspace.CurrentCamera
-            local cf = cam.CFrame
-            local dir = Vector3.new(0,0,0)
-            if flyDirection.f == 1 then dir = dir + cf.LookVector end
-            if flyDirection.b == 1 then dir = dir - cf.LookVector end
-            if flyDirection.r == 1 then dir = dir + cf.RightVector end
-            if flyDirection.l == 1 then dir = dir - cf.RightVector end
-            if flyDirection.u == 1 then dir = dir + Vector3.new(0,1,0) end
-            if flyDirection.d == 1 then dir = dir - Vector3.new(0,1,0) end
-            if dir.Magnitude > 0 then root.CFrame = root.CFrame + dir.Unit * 80 * 0.016 end
-        end)
+    if isFlying then return end
+    local hrp = getHRP()
+    if not hrp then return end
+
+    isFlying = true
+
+    local success = false
+
+    -- Try BodyGyro + BodyVelocity (IY-style)
+    local ok, _ = pcall(function()
+        flyBodyVelocity = Instance.new("BodyVelocity")
+        flyBodyVelocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+        flyBodyVelocity.Velocity = Vector3.new(0, 0, 0)
+        flyBodyVelocity.P = 10000
+        flyBodyVelocity.Parent = hrp
+
+        flyBodyGyro = Instance.new("BodyGyro")
+        flyBodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+        flyBodyGyro.P = 15000
+        flyBodyGyro.D = 1000
+        flyBodyGyro.Parent = hrp
+
+        success = true
+    end)
+
+    if not success then
+        -- CFrame fallback
+        flyBodyVelocity = nil
+        flyBodyGyro = nil
     end
+
+    local camera = Workspace.CurrentCamera
+
+    flyConn = RunService.Heartbeat:Connect(function(dt)
+        if not isFlying then return end
+        local char = getCharacter()
+        if not char then return end
+        local hr = char:FindFirstChild("HumanoidRootPart")
+        if not hr then return end
+
+        local camCF = camera.CFrame
+        local direction = Vector3.new(0, 0, 0)
+
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+            direction = direction + camCF.LookVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+            direction = direction - camCF.LookVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+            direction = direction - camCF.RightVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+            direction = direction + camCF.RightVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+            direction = direction + Vector3.new(0, 1, 0)
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+            direction = direction - Vector3.new(0, 1, 0)
+        end
+
+        if direction.Magnitude > 0 then
+            direction = direction.Unit * flySpeed
+        end
+
+        if flyBodyVelocity and flyBodyVelocity.Parent then
+            flyBodyVelocity.Velocity = direction
+            if flyBodyGyro and flyBodyGyro.Parent then
+                flyBodyGyro.CFrame = camCF
+            end
+        else
+            -- CFrame fallback
+            hr.CFrame = hr.CFrame + (direction * dt)
+        end
+    end)
 end
 
 local function stopFly()
-    flying = false
-    IY_NOFLY()
-    if flyConn then flyConn:Disconnect() flyConn = nil end
+    isFlying = false
+    if flyConn then
+        flyConn:Disconnect()
+        flyConn = nil
+    end
+    if flyBodyVelocity then
+        flyBodyVelocity:Destroy()
+        flyBodyVelocity = nil
+    end
+    if flyBodyGyro then
+        flyBodyGyro:Destroy()
+        flyBodyGyro = nil
+    end
 end
 
--- ═══════════════ SELL ORE ═══════════════
-local function sellAllOre()
-    local root = getRootPart()
-    if not root then return 0 end
-    
-    local npcPart = getNPCPart()
-    if not npcPart then return 0 end
-    
-    root.CFrame = CFrame.new(npcPart.Position + Vector3.new(0, 3, 0))
-    task.wait(0.5)
-    
-    local npc = workspace.Entities:FindFirstChild(NPC_NAME)
-    if npc then
-        local hrp = npc:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            local prompt = hrp:FindFirstChild("Prompt")
-            if prompt then
-                local interact = prompt:FindFirstChild("Interact")
-                if interact and interact:FindFirstChild("Event") then
-                    interact.Event:FireServer()
-                    task.wait(0.3)
-                end
-            end
-        end
+local function toggleFly()
+    if isFlying then
+        stopFly()
+    else
+        startFly()
     end
-    
-    local totalEarned = 0
-    local sellRemote = ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("SellOre")
-    if not sellRemote then return 0 end
-    
-    local bp = getBackpack()
+end
+
+--// ============================================================
+--// MINING / FARMING
+--// ============================================================
+
+local function mineRock(rock)
+    local toolEvent = getToolEvent()
+    if not toolEvent then return false end
+
     local char = getCharacter()
-    
-    for _, oreName in pairs(ORE_NAMES) do
-        local amount = 0
-        if bp then
-            for _, item in pairs(bp:GetChildren()) do
-                if item.Name == oreName then amount = amount + 1 end
-            end
-        end
-        if char then
-            for _, item in pairs(char:GetChildren()) do
-                if item.Name == oreName then amount = amount + 1 end
-            end
-        end
-        if amount > 0 then
-            local price = ORE_PRICES[oreName] or 0
-            totalEarned = totalEarned + (price * amount)
-            pcall(function() sellRemote:FireServer(oreName, amount) end)
-            task.wait(0.15)
+    if not char then return false end
+
+    -- Find pickaxe in Character or Backpack
+    local pickaxe = nil
+    for _, item in ipairs(char:GetChildren()) do
+        if item:IsA("Tool") or item.Name:lower():find("pickaxe") or item.Name:lower():find("pick") then
+            pickaxe = item
+            break
         end
     end
-    return totalEarned
-end
-
--- ═══════════════ STATUS UPDATE ═══════════════
-local function updateStatus(text)
-    local gui = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("AIScriptGUI")
-    if gui then
-        local status = gui.MainFrame:FindFirstChild("Status")
-        if status then status.Text = text end
-    end
-end
-
--- ═══════════════ MINE LOOP ═══════════════
-local minedRocks = {}
-
-local function farmLoop()
-    minedRocks = {}
-    
-    -- TP to cave first
-    local root = getRootPart()
-    if root then
-        root.CFrame = CFrame.new(CAVE_POS)
-        updateStatus("TP'd to cave...")
-        task.wait(1)
-    end
-    
-    while farming do
-        root = getRootPart()
-        if not root then
-            updateStatus("No character, waiting...")
-            task.wait(1)
-            continue
-        end
-        
-        local rock = findNearestRock(minedRocks)
-        if not rock then
-            minedRocks = {}
-            rock = findNearestRock(nil)
-            if not rock then
-                updateStatus("No rocks found, waiting...")
-                task.wait(1)
-                continue
-            end
-        end
-        
-        updateStatus("Rock found, preparing...")
-        local oreBefore = countOre()
-        
-        local pickaxe = getPickaxe()
-        if not pickaxe then
-            updateStatus("No pickaxe!")
-            task.wait(1)
-            continue
-        end
-        
-        if pickaxe.Parent == getBackpack() then
-            local hum = getCharacter() and getCharacter():FindFirstChild("Humanoid")
-            if hum then
-                hum:EquipTool(pickaxe)
-                task.wait(0.5)
-                pickaxe = getPickaxe()
-            end
-        end
-        if not pickaxe then
-            updateStatus("Pickaxe equip failed!")
-            task.wait(1)
-            continue
-        end
-        
-        -- Stop noclip while mining
-        local wasNoclipping = noclipping
-        if noclipping then stopNoclip() end
-        
-        -- Position player
-        local rockPos = rock.Position
-        
-        if insideRockMode then
-            -- INSIDE ROCK: TP inside the rock, camera looks at rock
-            root.CFrame = CFrame.new(rockPos)
-            createPlatform(rockPos)
-        else
-            -- NEAR ROCK: stand 5 studs away, platform under feet
-            local direction = (rockPos - root.Position).Unit
-            local standPos = rockPos - direction * MINE_DISTANCE
-            root.CFrame = CFrame.new(standPos, rockPos)
-            createPlatform(standPos)
-        end
-        
-        startPlatformFollow(rock)
-        task.wait(0.3)
-        
-        root = getRootPart()
-        if not root then
-            removePlatform()
-            if wasNoclipping then startNoclip() end
-            task.wait(1)
-            continue
-        end
-        
-        local toolFolder = ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("Tool")
-        local toolEvent = toolFolder and toolFolder:FindFirstChild("Event")
-        if not toolEvent then
-            updateStatus("Tool.Event NOT FOUND!")
-            removePlatform()
-            if wasNoclipping then startNoclip() end
-            task.wait(1)
-            continue
-        end
-        
-        local char = getCharacter()
-        if not char then
-            removePlatform()
-            if wasNoclipping then startNoclip() end
-            task.wait(1)
-            continue
-        end
-        
-        local currentPickaxe = char:FindFirstChild("Pickaxe")
-        if not currentPickaxe then
-            for _, child in pairs(char:GetChildren()) do
-                if child:IsA("Tool") or child.Name:lower():find("pick") then
-                    currentPickaxe = child
+    if not pickaxe then
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        if backpack then
+            for _, item in ipairs(backpack:GetChildren()) do
+                if item:IsA("Tool") or item.Name:lower():find("pickaxe") or item.Name:lower():find("pick") then
+                    pickaxe = item
                     break
                 end
             end
-            if not currentPickaxe then
-                removePlatform()
-                if wasNoclipping then startNoclip() end
-                task.wait(1)
-                continue
-            end
         end
-        
-        updateStatus("Mining... (" .. currentPickaxe.Name .. ")")
-        
-        local hitCount = 0
-        local maxHits = 60
-        local rockBroken = false
-        local noOreHits = 0
-        
-        while farming and hitCount < maxHits do
-            if not rock or rock.Parent == nil then
-                rockBroken = true
-                break
-            end
-            local rocksFolder = getRocksFolder()
-            if rocksFolder and not rocksFolder:IsAncestorOf(rock) then
-                rockBroken = true
-                break
-            end
-            local oreNow = countOre()
-            if oreNow > oreBefore then
-                rockBroken = true
-                break
-            end
-            
-            -- Re-position
-            if insideRockMode then
-                root.CFrame = CFrame.new(rock.Position)
-            else
-                rockPos = rock.Position
-                local direction = (rockPos - root.Position).Unit
-                local standPos = rockPos - direction * MINE_DISTANCE
-                root.CFrame = CFrame.new(standPos, rockPos)
-            end
-            
-            currentPickaxe = char:FindFirstChild("Pickaxe")
-            if not currentPickaxe then
-                for _, child in pairs(char:GetChildren()) do
-                    if child:IsA("Tool") or child.Name:lower():find("pick") then
-                        currentPickaxe = child
-                        break
-                    end
-                end
-                if not currentPickaxe then break end
-            end
-            
-            -- Fire mine remote TWICE
-            pcall(function() toolEvent:FireServer("MineOres", currentPickaxe, rock) end)
-            pcall(function() toolEvent:FireServer("MineOres", currentPickaxe, rock) end)
-            
-            hitCount = hitCount + 1
-            noOreHits = noOreHits + 1
-            
-            if noOreHits >= 15 then
-                local stillValid = false
-                local folder = getRocksFolder()
-                if folder then
-                    for _, r in pairs(folder:GetChildren()) do
-                        if r == rock then stillValid = true break end
-                    end
-                end
-                if not stillValid then break end
-                noOreHits = 0
-            end
-            
-            updateStatus("Hitting rock... (" .. hitCount .. ")")
-            task.wait(HIT_COOLDOWN)
-        end
-        
-        removePlatform()
-        
-        if rockBroken then
-            minedRocks[rock] = true
-            updateStatus("Rock broken! Next...")
-        end
-        if hitCount >= maxHits and not rockBroken then
-            minedRocks[rock] = true
-            updateStatus("Rock bugged, skip...")
-        end
-        
-        if wasNoclipping then startNoclip() end
-        
-        if countOre() >= 20 then
-            updateStatus("Selling ore...")
-            local earned = sellAllOre()
-            totalMoneyEarned = totalMoneyEarned + earned
-            minedRocks = {}
-            root = getRootPart()
-            if root then root.CFrame = CFrame.new(CAVE_POS) end
-            task.wait(0.5)
-        end
-        
-        task.wait(0.3)
     end
-    
+
+    -- Fire double MineOres remote (game sends 2 per hit)
+    pcall(function()
+        -- First: pickaxe in Character
+        if pickaxe then
+            toolEvent:FireServer("MineOres", pickaxe, rock)
+        else
+            toolEvent:FireServer("MineOres", rock)
+        end
+        -- Second: pickaxe Parented to nil (animation state)
+        if pickaxe then
+            local oldParent = pickaxe.Parent
+            pickaxe.Parent = nil
+            toolEvent:FireServer("MineOres", pickaxe, rock)
+            pickaxe.Parent = oldParent
+        end
+    end)
+
+    return true
+end
+
+local function sellOre()
+    local sellRemote = getSellRemote()
+    if not sellRemote then return false end
+
+    local inventory = countInventoryItems()
+    local sold = false
+
+    for oreName, count in pairs(inventory) do
+        if count > 0 and ORE_PRICES[oreName] then
+            pcall(function()
+                sellRemote:FireServer(oreName, count)
+            end)
+            sold = true
+        end
+    end
+
+    return sold
+end
+
+local function teleportTo(position)
+    local hrp = getHRP()
+    if hrp then
+        hrp.CFrame = CFrame.new(position)
+    end
+end
+
+local function sellAllOre()
+    local buyer = getMineralBuyer()
+    if not buyer then return end
+
+    -- Get earnings before selling
+    local inventory = countInventoryItems()
+    local earningsBefore = calculateEarnings(inventory)
+
+    -- TP to buyer
+    local buyerPos = buyer:FindFirstChild("HumanoidRootPart") and buyer.HumanoidRootPart.Position or buyer.PrimaryPart and buyer.PrimaryPart.Position or buyer.Position
+    if buyerPos then
+        teleportTo(buyerPos + Vector3.new(0, 0, 3))
+        wait(0.3)
+    end
+
+    -- Sell
+    sellOre()
+    wait(0.5)
+
+    -- Return to cave
+    teleportTo(CAVE_POS)
+    wait(0.3)
+end
+
+--// ============================================================
+--// MAIN FARM LOOP
+--// ============================================================
+
+local farmThread = nil
+
+local function farmLoop()
+    while isFarming do
+        -- Find nearest rock (skip already mined ones)
+        local rock, dist = findNearestRock(minedRocks)
+
+        if not rock then
+            -- All rocks mined, reset cache and wait
+            minedRocks = {}
+            wait(2)
+            continue
+        end
+
+        if not isRockValid(rock) then
+            table.insert(minedRocks, rock)
+            continue
+        end
+
+        -- TP to cave first time or after sell
+        local hrp = getHRP()
+        if not hrp then
+            wait(1)
+            continue
+        end
+
+        -- Check distance to cave - if far, TP to cave first
+        local distToCave = (hrp.Position - CAVE_POS).Magnitude
+        if distToCave > 200 then
+            teleportTo(CAVE_POS)
+            wait(0.5)
+        end
+
+        -- Position: stand 5 studs from rock, looking at it
+        local rockPos = rock.Position
+        local direction = (hrp.Position - rockPos).Unit
+        local standPos = rockPos + (direction * MINING_DISTANCE)
+        standPos = Vector3.new(standPos.X, rockPos.Y + 3, standPos.Z)
+
+        teleportTo(standPos)
+        wait(0.3)
+
+        -- Create platform under player
+        createPlatform(hrp.Position)
+
+        -- Look at rock
+        hrp.CFrame = CFrame.new(hrp.Position, rockPos)
+
+        -- Disable noclip for mining
+        if isNoclipping then
+            toggleNoclip(false)
+        end
+
+        -- Mine the rock
+        local hitCount = 0
+        local maxHits = 60 -- Safety timeout (15 seconds at 0.45 interval)
+
+        while isFarming and isRockValid(rock) and hitCount < maxHits do
+            -- Check if rock still exists
+            if rock.Parent == nil or not Workspace:IsAncestorOf(rock) then
+                break
+            end
+
+            -- Track inventory before hit
+            local invBefore = countInventoryItems()
+            local oreBefore = getTotalOreCount(invBefore)
+
+            -- Mine
+            mineRock(rock)
+            hitCount = hitCount + 1
+
+            wait(HIT_INTERVAL)
+
+            -- Check if ore appeared in inventory (rock broken)
+            local invAfter = countInventoryItems()
+            local oreAfter = getTotalOreCount(invAfter)
+
+            if oreAfter > oreBefore then
+                -- Rock broken!
+                totalOreMined = totalOreMined + (oreAfter - oreBefore)
+                currentSessionOre = currentSessionOre + (oreAfter - oreBefore)
+                break
+            end
+        end
+
+        -- Mark rock as mined
+        table.insert(minedRocks, rock)
+        lastRockPosition = rock.Position
+
+        -- Remove platform
+        removePlatform()
+
+        -- Check if we should sell
+        local currentInv = countInventoryItems()
+        local totalOre = getTotalOreCount(currentInv)
+
+        if totalOre >= 20 then
+            -- Sell ore
+            local earnings = calculateEarnings(currentInv)
+            totalEarnings = totalEarnings + earnings
+            currentSessionEarnings = currentSessionEarnings + earnings
+            sellAllOre()
+        end
+
+        -- Update platform position for next rock
+        wait(0.1)
+    end
+
+    -- Clean up
     removePlatform()
 end
 
--- ═══════════════ GUI ═══════════════
-local function createGui()
-    local old = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("AIScriptGUI")
-    if old then old:Destroy() end
-    
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "AIScriptGUI"
-    gui.ResetOnSpawn = false
-    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    
-    -- Main Frame
-    local frame = Instance.new("Frame")
-    frame.Name = "MainFrame"
-    frame.Size = UDim2.new(0, 260, 0, 360)
-    frame.Position = UDim2.new(0, 10, 0.5, -180)
-    frame.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
-    frame.BorderSizePixel = 0
-    frame.Active = true
-    frame.Draggable = true
-    frame.Parent = gui
-    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
-    
-    -- Title bar
-    local titleBar = Instance.new("Frame")
-    titleBar.Name = "TitleBar"
-    titleBar.Size = UDim2.new(1, 0, 0, 32)
-    titleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 50)
-    titleBar.BorderSizePixel = 0
-    titleBar.Parent = frame
-    Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 10)
-    
-    local titleLabel = Instance.new("TextLabel")
-    titleLabel.Size = UDim2.new(1, -10, 1, 0)
-    titleLabel.Position = UDim2.new(0, 10, 0, 0)
-    titleLabel.BackgroundTransparency = 1
-    titleLabel.Text = "AI Script v0.02"
-    titleLabel.TextColor3 = Color3.fromRGB(180, 180, 255)
-    titleLabel.Font = Enum.Font.GothamBold
-    titleLabel.TextSize = 14
-    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-    titleLabel.Parent = titleBar
-    
-    -- ═══════════════ PAGE: MAIN ═══════════════
-    local mainPage = Instance.new("Frame")
-    mainPage.Name = "MainPage"
-    mainPage.Size = UDim2.new(1, -16, 1, -40)
-    mainPage.Position = UDim2.new(0, 8, 0, 36)
-    mainPage.BackgroundTransparency = 1
-    mainPage.Parent = frame
-    
-    -- Ore Farm Button
-    local oreBtn = Instance.new("TextButton")
-    oreBtn.Size = UDim2.new(1, 0, 0, 45)
-    oreBtn.Position = UDim2.new(0, 0, 0, 10)
-    oreBtn.BackgroundColor3 = Color3.fromRGB(40, 80, 60)
-    oreBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    oreBtn.Font = Enum.Font.GothamBold
-    oreBtn.TextSize = 14
-    oreBtn.Text = "⛏️ ORE FARM"
-    oreBtn.Parent = mainPage
-    Instance.new("UICorner", oreBtn).CornerRadius = UDim.new(0, 8)
-    
-    -- Fly Toggle
-    local flyBtn = Instance.new("TextButton")
-    flyBtn.Name = "FlyBtn"
-    flyBtn.Size = UDim2.new(0.48, 0, 0, 40)
-    flyBtn.Position = UDim2.new(0, 0, 0, 65)
-    flyBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 90)
-    flyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    flyBtn.Font = Enum.Font.Gotham
-    flyBtn.TextSize = 12
-    flyBtn.Text = "✈️ FLY"
-    flyBtn.Parent = mainPage
-    Instance.new("UICorner", flyBtn).CornerRadius = UDim.new(0, 8)
-    
-    -- Noclip Toggle
-    local noclipBtn = Instance.new("TextButton")
-    noclipBtn.Name = "NoclipBtn"
-    noclipBtn.Size = UDim2.new(0.48, 0, 0, 40)
-    noclipBtn.Position = UDim2.new(0.52, 0, 0, 65)
-    noclipBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 90)
-    noclipBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    noclipBtn.Font = Enum.Font.Gotham
-    noclipBtn.TextSize = 12
-    noclipBtn.Text = "👻 NOCLIP"
-    noclipBtn.Parent = mainPage
-    Instance.new("UICorner", noclipBtn).CornerRadius = UDim.new(0, 8)
-    
-    -- No Fall Damage Toggle
-    local dmgBtn = Instance.new("TextButton")
-    dmgBtn.Name = "DmgBtn"
-    dmgBtn.Size = UDim2.new(1, 0, 0, 40)
-    dmgBtn.Position = UDim2.new(0, 0, 0, 115)
-    dmgBtn.BackgroundColor3 = Color3.fromRGB(90, 40, 40)
-    dmgBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    dmgBtn.Font = Enum.Font.Gotham
-    dmgBtn.TextSize = 12
-    dmgBtn.Text = "🛡️ NO FALL DMG: OFF"
-    dmgBtn.Parent = mainPage
-    Instance.new("UICorner", dmgBtn).CornerRadius = UDim.new(0, 8)
-    
-    -- TP to Cave
-    local caveBtn = Instance.new("TextButton")
-    caveBtn.Size = UDim2.new(1, 0, 0, 35)
-    caveBtn.Position = UDim2.new(0, 0, 0, 165)
-    caveBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
-    caveBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    caveBtn.Font = Enum.Font.Gotham
-    caveBtn.TextSize = 11
-    caveBtn.Text = "🕳️ TP TO CAVE"
-    caveBtn.Parent = mainPage
-    Instance.new("UICorner", caveBtn).CornerRadius = UDim.new(0, 8)
-    
-    -- Info
-    local infoLabel = Instance.new("TextLabel")
-    infoLabel.Size = UDim2.new(1, 0, 0, 40)
-    infoLabel.Position = UDim2.new(0, 0, 0, 210)
-    infoLabel.BackgroundTransparency = 1
-    infoLabel.TextColor3 = Color3.fromRGB(100, 100, 130)
-    infoLabel.Font = Enum.Font.Gotham
-    infoLabel.TextSize = 9
-    infoLabel.Text = "Fly: WASD+Q/E | Speed: 1-9\nCtrl+F fly | Ctrl+N noclip"
-    infoLabel.TextYAlignment = Enum.TextYAlignment.Top
-    infoLabel.Parent = mainPage
-    
-    -- More coming soon label
-    local soonLabel = Instance.new("TextLabel")
-    soonLabel.Size = UDim2.new(1, 0, 0, 30)
-    soonLabel.Position = UDim2.new(0, 0, 0, 255)
-    soonLabel.BackgroundTransparency = 1
-    soonLabel.TextColor3 = Color3.fromRGB(80, 80, 100)
-    soonLabel.Font = Enum.Font.GothamItalic
-    soonLabel.TextSize = 10
-    soonLabel.Text = "More modules coming soon..."
-    soonLabel.Parent = mainPage
-    
-    -- ═══════════════ PAGE: ORE FARM ═══════════════
-    local orePage = Instance.new("Frame")
-    orePage.Name = "OrePage"
-    orePage.Size = UDim2.new(1, -16, 1, -40)
-    orePage.Position = UDim2.new(0, 8, 0, 36)
-    orePage.BackgroundTransparency = 1
-    orePage.Visible = false
-    orePage.Parent = frame
-    
-    -- Back button
-    local backBtn = Instance.new("TextButton")
-    backBtn.Name = "BackBtn"
-    backBtn.Size = UDim2.new(0, 25, 0, 18)
-    backBtn.Position = UDim2.new(0, 2, 0, 0)
-    backBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
-    backBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    backBtn.Font = Enum.Font.GothamBold
-    backBtn.TextSize = 11
-    backBtn.Text = "◀"
-    backBtn.Parent = orePage
-    Instance.new("UICorner", backBtn).CornerRadius = UDim.new(0, 5)
-    
-    -- Page title
-    local oreTitle = Instance.new("TextLabel")
-    oreTitle.Size = UDim2.new(1, -35, 0, 18)
-    oreTitle.Position = UDim2.new(0, 30, 0, 0)
-    oreTitle.BackgroundTransparency = 1
-    oreTitle.Text = "⛏️ ORE FARM"
-    oreTitle.TextColor3 = Color3.fromRGB(180, 255, 180)
-    oreTitle.Font = Enum.Font.GothamBold
-    oreTitle.TextSize = 12
-    oreTitle.TextXAlignment = Enum.TextXAlignment.Left
-    oreTitle.Parent = orePage
-    
-    -- Start Farm
-    local farmBtn = Instance.new("TextButton")
-    farmBtn.Name = "FarmBtn"
-    farmBtn.Size = UDim2.new(1, 0, 0, 35)
-    farmBtn.Position = UDim2.new(0, 0, 0, 25)
-    farmBtn.BackgroundColor3 = Color3.fromRGB(50, 120, 50)
-    farmBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    farmBtn.Font = Enum.Font.GothamBold
-    farmBtn.TextSize = 13
-    farmBtn.Text = "⛏️ START FARM"
-    farmBtn.Parent = orePage
-    Instance.new("UICorner", farmBtn).CornerRadius = UDim.new(0, 8)
-    
-    -- Sell
-    local sellBtn = Instance.new("TextButton")
-    sellBtn.Size = UDim2.new(0.48, 0, 0, 30)
-    sellBtn.Position = UDim2.new(0, 0, 0, 67)
-    sellBtn.BackgroundColor3 = Color3.fromRGB(120, 100, 30)
-    sellBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    sellBtn.Font = Enum.Font.Gotham
-    sellBtn.TextSize = 11
-    sellBtn.Text = "💰 SELL ORE"
-    sellBtn.Parent = orePage
-    Instance.new("UICorner", sellBtn).CornerRadius = UDim.new(0, 6)
-    
-    -- Inside Rock Mode
-    local insideBtn = Instance.new("TextButton")
-    insideBtn.Name = "InsideBtn"
-    insideBtn.Size = UDim2.new(0.48, 0, 0, 30)
-    insideBtn.Position = UDim2.new(0.52, 0, 0, 67)
-    insideBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 100)
-    insideBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    insideBtn.Font = Enum.Font.Gotham
-    insideBtn.TextSize = 10
-    insideBtn.Text = "🪨 INSIDE: OFF"
-    insideBtn.Parent = orePage
-    Instance.new("UICorner", insideBtn).CornerRadius = UDim.new(0, 6)
-    
-    -- Stats
-    local statsLabel = Instance.new("TextLabel")
-    statsLabel.Name = "Stats"
-    statsLabel.Size = UDim2.new(1, 0, 0, 70)
-    statsLabel.Position = UDim2.new(0, 0, 0, 105)
-    statsLabel.BackgroundColor3 = Color3.fromRGB(30, 30, 45)
-    statsLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-    statsLabel.Font = Enum.Font.Gotham
-    statsLabel.TextSize = 11
-    statsLabel.TextXAlignment = Enum.TextXAlignment.Left
-    statsLabel.Text = "⏱️ Time: 0:00:00\n💵 Earned: $0\n📈 $/Hour: $0\n💎 Ore: 0"
-    statsLabel.Parent = orePage
-    Instance.new("UICorner", statsLabel).CornerRadius = UDim.new(0, 6)
-    
-    -- Status
-    local statusLabel = Instance.new("TextLabel")
-    statusLabel.Name = "Status"
-    statusLabel.Size = UDim2.new(1, 0, 0, 22)
-    statusLabel.Position = UDim2.new(0, 0, 0, 183)
-    statusLabel.BackgroundColor3 = Color3.fromRGB(30, 30, 45)
-    statusLabel.TextColor3 = Color3.fromRGB(150, 255, 150)
-    statusLabel.Font = Enum.Font.Gotham
-    statusLabel.TextSize = 10
-    statusLabel.Text = "Ready"
-    statusLabel.Parent = orePage
-    Instance.new("UICorner", statusLabel).CornerRadius = UDim.new(0, 6)
-    
-    -- ═══════════════ PAGE NAVIGATION ═══════════════
-    local function showPage(pageName)
-        mainPage.Visible = (pageName == "main")
-        orePage.Visible = (pageName == "ore")
-    end
-    
-    oreBtn.MouseButton1Click:Connect(function()
-        showPage("ore")
-    end)
-    
-    backBtn.MouseButton1Click:Connect(function()
-        showPage("main")
-    end)
-    
-    -- ═══════════════ BUTTON LOGIC ═══════════════
-    
-    -- Farm toggle
-    farmBtn.MouseButton1Click:Connect(function()
-        farming = not farming
-        if farming then
-            farmBtn.Text = "⏹️ STOP FARM"
-            farmBtn.BackgroundColor3 = Color3.fromRGB(160, 50, 50)
-            statusLabel.Text = "Farming..."
-            statusLabel.TextColor3 = Color3.fromRGB(150, 255, 150)
-            farmStartTime = tick()
-            totalMoneyEarned = 0
-            frozenElapsed = 0
-            enableAntiAfk()
-            coroutine.wrap(farmLoop)()
-        else
-            farmBtn.Text = "⛏️ START FARM"
-            farmBtn.BackgroundColor3 = Color3.fromRGB(50, 120, 50)
-            statusLabel.Text = "Stopped"
-            statusLabel.TextColor3 = Color3.fromRGB(255, 150, 150)
-            removePlatform()
-            if farmStartTime > 0 then
-                frozenElapsed = tick() - farmStartTime
-            end
-        end
-    end)
-    
-    -- Sell
-    sellBtn.MouseButton1Click:Connect(function()
-        statusLabel.Text = "Selling..."
-        task.spawn(function()
-            local earned = sellAllOre()
-            totalMoneyEarned = totalMoneyEarned + earned
-            statusLabel.Text = "Sold! +$" .. tostring(earned)
-            task.wait(2)
-            if not farming then statusLabel.Text = "Ready"
-            else statusLabel.Text = "Farming..." end
-        end)
-    end)
-    
-    -- Inside Rock toggle
-    insideBtn.MouseButton1Click:Connect(function()
-        insideRockMode = not insideRockMode
-        if insideRockMode then
-            insideBtn.Text = "🪨 INSIDE: ON"
-            insideBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
-            statusLabel.Text = "Inside rock mode ON"
-        else
-            insideBtn.Text = "🪨 INSIDE: OFF"
-            insideBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 100)
-            statusLabel.Text = "Inside rock mode OFF"
-        end
-    end)
-    
-    -- TP Cave
-    caveBtn.MouseButton1Click:Connect(function()
-        local root = getRootPart()
-        if root then
-            root.CFrame = CFrame.new(CAVE_POS)
-        end
-    end)
-    
-    -- Fly
-    flyBtn.MouseButton1Click:Connect(function()
-        if flying then
-            stopFly()
-            flyBtn.Text = "✈️ FLY"
-            flyBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 90)
-        else
-            startFly()
-            flyBtn.Text = "✈️ FLY: ON"
-            flyBtn.BackgroundColor3 = Color3.fromRGB(40, 100, 160)
-        end
-    end)
-    
-    -- Noclip
-    noclipBtn.MouseButton1Click:Connect(function()
-        if noclipping then
-            stopNoclip()
-            noclipBtn.Text = "👻 NOCLIP"
-            noclipBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 90)
-        else
-            startNoclip()
-            noclipBtn.Text = "👻 NOCLIP: ON"
-            noclipBtn.BackgroundColor3 = Color3.fromRGB(40, 100, 160)
-        end
-    end)
-    
-    -- No Fall Damage
-    dmgBtn.MouseButton1Click:Connect(function()
-        if dmgBlocked then
-            disableDmgBlock()
-            dmgBtn.Text = "🛡️ NO FALL DMG: OFF"
-            dmgBtn.BackgroundColor3 = Color3.fromRGB(90, 40, 40)
-        else
-            enableDmgBlock()
-            if dmgBlocked then
-                dmgBtn.Text = "🛡️ NO FALL DMG: ON"
-                dmgBtn.BackgroundColor3 = Color3.fromRGB(40, 130, 40)
-            end
-        end
-    end)
-    
-    gui.Parent = LocalPlayer:FindFirstChild("PlayerGui")
-    return gui
+local function startFarming()
+    if isFarming then return end
+    isFarming = true
+    farmStartTime = tick()
+    frozenTimeStr = "00:00:00"
+    frozenOreCount = 0
+    frozenEarnings = 0
+    currentSessionOre = 0
+    currentSessionEarnings = 0
+    minedRocks = {}
+
+    -- TP to cave
+    teleportTo(CAVE_POS)
+    wait(0.5)
+
+    -- Start farm in new thread
+    farmThread = coroutine.wrap(farmLoop)
+    farmThread()
 end
 
--- ═══════════════ INPUT HANDLING ═══════════════
-UserInputService.InputBegan:Connect(function(input, gpe)
-    if gpe then return end
-    
-    if input.KeyCode == Enum.KeyCode.F and UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
-        if flying then stopFly() else startFly() end
+local function stopFarming()
+    isFarming = false
+    removePlatform()
+
+    -- Freeze timer values
+    if farmStartTime > 0 then
+        frozenTimeStr = formatTime(tick() - farmStartTime)
     end
-    if input.KeyCode == Enum.KeyCode.N and UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
-        if noclipping then stopNoclip() else startNoclip() end
-    end
-    
-    if input.KeyCode == Enum.KeyCode.W then flyDirection.f = 1 end
-    if input.KeyCode == Enum.KeyCode.S then flyDirection.b = 1 end
-    if input.KeyCode == Enum.KeyCode.A then flyDirection.l = 1 end
-    if input.KeyCode == Enum.KeyCode.D then flyDirection.r = 1 end
-    if input.KeyCode == Enum.KeyCode.Space then flyDirection.u = 1 end
-    if input.KeyCode == Enum.KeyCode.LeftShift then flyDirection.d = 1 end
-    
-    if flying then
-        local num = input.KeyCode.Value - 0x30
-        if num >= 1 and num <= 9 then flyspeed = num end
-    end
+    frozenOreCount = currentSessionOre
+    frozenEarnings = currentSessionEarnings
+
+    -- Re-enable noclip if it was on
+    -- (it's toggled off during mining, user can re-enable)
+end
+
+--// ============================================================
+--// UI - TAB SYSTEM
+--// ============================================================
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "AIScript"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = game:GetService("CoreGui")
+
+--// Main Frame
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 380, 0, 520)
+MainFrame.Position = UDim2.new(0.5, -190, 0.5, -260)
+MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 12)
+MainCorner.Parent = MainFrame
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(60, 60, 80)
+MainStroke.Thickness = 1.5
+MainStroke.Parent = MainFrame
+
+--// Title Bar
+local TitleBar = Instance.new("Frame")
+TitleBar.Name = "TitleBar"
+TitleBar.Size = UDim2.new(1, 0, 0, 40)
+TitleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+TitleBar.BorderSizePixel = 0
+TitleBar.Parent = MainFrame
+
+local TitleCorner = Instance.new("UICorner")
+TitleCorner.CornerRadius = UDim.new(0, 12)
+TitleCorner.Parent = TitleBar
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Text = "AI SCRIPT v0.01"
+TitleLabel.Size = UDim2.new(1, -40, 1, 0)
+TitleLabel.Position = UDim2.new(0, 15, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.TextColor3 = Color3.fromRGB(200, 200, 255)
+TitleLabel.TextSize = 16
+TitleLabel.Font = Enum.Font.GothamBold
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = TitleBar
+
+-- Close Button
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Text = "X"
+CloseBtn.Size = UDim2.new(0, 30, 0, 30)
+CloseBtn.Position = UDim2.new(1, -35, 0, 5)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.TextSize = 14
+CloseBtn.BorderSizePixel = 0
+CloseBtn.Parent = TitleBar
+
+local CloseCorner = Instance.new("UICorner")
+CloseCorner.CornerRadius = UDim.new(0, 6)
+CloseCorner.Parent = CloseBtn
+
+CloseBtn.MouseButton1Click:Connect(function()
+    ScreenGui:Destroy()
+    stopFly()
+    toggleNoclip(false)
+    toggleNoFallDMG(false)
+    isFarming = false
+    removePlatform()
 end)
 
-UserInputService.InputEnded:Connect(function(input)
-    if input.KeyCode == Enum.KeyCode.W then flyDirection.f = 0 end
-    if input.KeyCode == Enum.KeyCode.S then flyDirection.b = 0 end
-    if input.KeyCode == Enum.KeyCode.A then flyDirection.l = 0 end
-    if input.KeyCode == Enum.KeyCode.D then flyDirection.r = 0 end
-    if input.KeyCode == Enum.KeyCode.Space then flyDirection.u = 0 end
-    if input.KeyCode == Enum.KeyCode.LeftShift then flyDirection.d = 0 end
-end)
+--// Minimize Button
+local MinBtn = Instance.new("TextButton")
+MinBtn.Text = "-"
+MinBtn.Size = UDim2.new(0, 30, 0, 30)
+MinBtn.Position = UDim2.new(1, -70, 0, 5)
+MinBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
+MinBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+MinBtn.Font = Enum.Font.GothamBold
+MinBtn.TextSize = 14
+MinBtn.BorderSizePixel = 0
+MinBtn.Parent = TitleBar
 
--- ═══════════════ STATS UPDATE ═══════════════
-task.spawn(function()
-    while true do
-        local gui = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("AIScriptGUI")
-        if gui then
-            local stats = gui.MainFrame:FindFirstChild("OrePage") and gui.MainFrame.OrePage:FindFirstChild("Stats")
-            if stats then
-                if farming and farmStartTime > 0 then
-                    local elapsed = tick() - farmStartTime
-                    local hours = math.floor(elapsed / 3600)
-                    local mins = math.floor((elapsed % 3600) / 60)
-                    local secs = math.floor(elapsed % 60)
-                    local timeStr = string.format("%d:%02d:%02d", hours, mins, secs)
-                    local perHour = 0
-                    if elapsed > 0 then perHour = math.floor(totalMoneyEarned / (elapsed / 3600)) end
-                    stats.Text = "⏱️ Time: " .. timeStr .. "\n💵 Earned: $" .. tostring(totalMoneyEarned) .. "\n📈 $/Hour: $" .. tostring(perHour) .. "\n💎 Ore: " .. tostring(countOre())
-                elseif not farming and farmStartTime > 0 then
-                    local elapsed = frozenElapsed or 0
-                    local hours = math.floor(elapsed / 3600)
-                    local mins = math.floor((elapsed % 3600) / 60)
-                    local secs = math.floor(elapsed % 60)
-                    local timeStr = string.format("%d:%02d:%02d", hours, mins, secs)
-                    local perHour = 0
-                    if elapsed > 0 then perHour = math.floor(totalMoneyEarned / (elapsed / 3600)) end
-                    stats.Text = "⏱️ Time: " .. timeStr .. " (stopped)\n💵 Earned: $" .. tostring(totalMoneyEarned) .. "\n📈 $/Hour: $" .. tostring(perHour) .. "\n💎 Ore: " .. tostring(countOre())
-                else
-                    stats.Text = "⏱️ Time: 0:00:00\n💵 Earned: $0\n📈 $/Hour: $0\n💎 Ore: " .. tostring(countOre())
-                end
-            end
+local MinCorner = Instance.new("UICorner")
+MinCorner.CornerRadius = UDim.new(0, 6)
+MinCorner.Parent = MinBtn
+
+--// Content Area (where pages swap)
+local ContentArea = Instance.new("Frame")
+ContentArea.Name = "ContentArea"
+ContentArea.Size = UDim2.new(1, -20, 1, -50)
+ContentArea.Position = UDim2.new(0, 10, 0, 45)
+ContentArea.BackgroundTransparency = 1
+ContentArea.Parent = MainFrame
+
+--// ============================================================
+--// PAGE: HOME (Tab Selector)
+--// ============================================================
+
+local HomePage = Instance.new("Frame")
+HomePage.Name = "HomePage"
+HomePage.Size = UDim2.new(1, 0, 1, 0)
+HomePage.BackgroundTransparency = 1
+HomePage.Parent = ContentArea
+
+local HomeTitle = Instance.new("TextLabel")
+HomeTitle.Text = "Select Feature"
+HomeTitle.Size = UDim2.new(1, 0, 0, 30)
+HomeTitle.BackgroundTransparency = 1
+HomeTitle.TextColor3 = Color3.fromRGB(160, 160, 200)
+HomeTitle.Font = Enum.Font.Gotham
+HomeTitle.TextSize = 13
+HomeTitle.Parent = HomePage
+
+-- Tab Buttons Container
+local TabsContainer = Instance.new("Frame")
+TabsContainer.Name = "TabsContainer"
+TabsContainer.Size = UDim2.new(1, 0, 1, -40)
+TabsContainer.Position = UDim2.new(0, 0, 0, 35)
+TabsContainer.BackgroundTransparency = 1
+TabsContainer.Parent = HomePage
+
+local TabsLayout = Instance.new("UIListLayout")
+TabsLayout.Padding = UDim.new(0, 8)
+TabsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+TabsLayout.Parent = TabsContainer
+
+-- Helper: Create Tab Button
+local function createTabButton(name, emoji, order)
+    local btn = Instance.new("TextButton")
+    btn.Name = name .. "Tab"
+    btn.Size = UDim2.new(1, 0, 0, 55)
+    btn.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+    btn.BorderSizePixel = 0
+    btn.Text = emoji .. "  " .. name
+    btn.TextColor3 = Color3.fromRGB(220, 220, 255)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 16
+    btn.LayoutOrder = order
+    btn.Parent = TabsContainer
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = btn
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(60, 60, 90)
+    stroke.Thickness = 1
+    stroke.Parent = btn
+
+    btn.MouseEnter:Connect(function()
+        btn.BackgroundColor3 = Color3.fromRGB(50, 50, 75)
+    end)
+    btn.MouseLeave:Connect(function()
+        btn.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+    end)
+
+    return btn
+end
+
+-- Create tab buttons
+local oreFarmTab = createTabButton("ORE FARM", "\xe2\x9b\x8f\xef\xb8\x8f", 1) -- ⛏️
+local flyTab = createTabButton("MOVEMENT", "\xf0\x9f\x9a\x80", 2) -- 🚀
+local miscTab = createTabButton("MISC", "\xe2\x9a\x99\xef\xb8\x8f", 3) -- ⚙️
+
+--// ============================================================
+--// BACK BUTTON (shared component for sub-pages)
+--// ============================================================
+
+local function createBackButton(parent)
+    local backBtn = Instance.new("TextButton")
+    backBtn.Name = "BackBtn"
+    backBtn.Size = UDim2.new(0, 80, 0, 28)
+    backBtn.Position = UDim2.new(0, 0, 0, 0)
+    backBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
+    backBtn.BorderSizePixel = 0
+    backBtn.Text = "\xe2\xac\x85\xef\xb8\x8f BACK" -- ⬅️ BACK
+    backBtn.TextColor3 = Color3.fromRGB(180, 180, 220)
+    backBtn.Font = Enum.Font.GothamBold
+    backBtn.TextSize = 11
+    backBtn.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = backBtn
+
+    return backBtn
+end
+
+--// ============================================================
+--// PAGE: ORE FARM
+--// ============================================================
+
+local OreFarmPage = Instance.new("Frame")
+OreFarmPage.Name = "OreFarmPage"
+OreFarmPage.Size = UDim2.new(1, 0, 1, 0)
+OreFarmPage.BackgroundTransparency = 1
+OreFarmPage.Visible = false
+OreFarmPage.Parent = ContentArea
+
+local oreBackBtn = createBackButton(OreFarmPage)
+
+local orePageLayout = Instance.new("UIListLayout")
+orePageLayout.Padding = UDim.new(0, 6)
+orePageLayout.SortOrder = Enum.SortOrder.LayoutOrder
+orePageLayout.Parent = OreFarmPage
+
+-- Title
+local oreTitle = Instance.new("TextLabel")
+oreTitle.Text = "\xe2\x9b\x8f\xef\xb8\x8f ORE FARM" -- ⛏️ ORE FARM
+oreTitle.Size = UDim2.new(1, 0, 0, 30)
+oreTitle.BackgroundTransparency = 1
+oreTitle.TextColor3 = Color3.fromRGB(100, 200, 255)
+oreTitle.Font = Enum.Font.GothamBold
+oreTitle.TextSize = 18
+oreTitle.LayoutOrder = 1
+oreTitle.Parent = OreFarmPage
+
+-- Start/Stop Farm Button
+local FarmBtn = Instance.new("TextButton")
+FarmBtn.Name = "FarmBtn"
+FarmBtn.Size = UDim2.new(1, 0, 0, 40)
+FarmBtn.BackgroundColor3 = Color3.fromRGB(40, 120, 40)
+FarmBtn.BorderSizePixel = 0
+FarmBtn.Text = "\xe2\x9b\x8f\xef\xb8\x8f START FARM" -- ⛏️ START FARM
+FarmBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+FarmBtn.Font = Enum.Font.GothamBold
+FarmBtn.TextSize = 15
+FarmBtn.LayoutOrder = 2
+FarmBtn.Parent = OreFarmPage
+
+local FarmBtnCorner = Instance.new("UICorner")
+FarmBtnCorner.CornerRadius = UDim.new(0, 8)
+FarmBtnCorner.Parent = FarmBtn
+
+-- Stats Frame
+local StatsFrame = Instance.new("Frame")
+StatsFrame.Size = UDim2.new(1, 0, 0, 115)
+StatsFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 42)
+StatsFrame.BorderSizePixel = 0
+StatsFrame.LayoutOrder = 3
+StatsFrame.Parent = OreFarmPage
+
+local StatsCorner = Instance.new("UICorner")
+StatsCorner.CornerRadius = UDim.new(0, 8)
+StatsCorner.Parent = StatsFrame
+
+local StatsLayout = Instance.new("UIListLayout")
+StatsLayout.Padding = UDim.new(0, 2)
+StatsLayout.Parent = StatsFrame
+
+local StatsPadding = Instance.new("UIPadding")
+StatsPadding.PaddingTop = UDim.new(0, 6)
+StatsPadding.PaddingLeft = UDim.new(0, 10)
+StatsPadding.Parent = StatsFrame
+
+-- Time Label
+local TimeLabel = Instance.new("TextLabel")
+TimeLabel.Text = "\xe2\x8f\xb1\xef\xb8\x8f Time: 00:00:00" -- ⏱️ Time
+TimeLabel.Size = UDim2.new(1, -20, 0, 22)
+TimeLabel.BackgroundTransparency = 1
+TimeLabel.TextColor3 = Color3.fromRGB(180, 180, 220)
+TimeLabel.Font = Enum.Font.Gotham
+TimeLabel.TextSize = 13
+TimeLabel.TextXAlignment = Enum.TextXAlignment.Left
+TimeLabel.Parent = StatsFrame
+
+-- Ore Count Label
+local OreLabel = Instance.new("TextLabel")
+OreLabel.Text = "\xf0\x9f\xaa\xa8 Ore Mined: 0" -- 🪨 Ore
+OreLabel.Size = UDim2.new(1, -20, 0, 22)
+OreLabel.BackgroundTransparency = 1
+OreLabel.TextColor3 = Color3.fromRGB(180, 180, 220)
+OreLabel.Font = Enum.Font.Gotham
+OreLabel.TextSize = 13
+OreLabel.TextXAlignment = Enum.TextXAlignment.Left
+OreLabel.Parent = StatsFrame
+
+-- Earnings Label
+local EarnLabel = Instance.new("TextLabel")
+EarnLabel.Text = "\xf0\x9f\x92\xb0 Earnings: $0" -- 💰 Earnings
+EarnLabel.Size = UDim2.new(1, -20, 0, 22)
+EarnLabel.BackgroundTransparency = 1
+EarnLabel.TextColor3 = Color3.fromRGB(180, 180, 220)
+EarnLabel.Font = Enum.Font.Gotham
+EarnLabel.TextSize = 13
+EarnLabel.TextXAlignment = Enum.TextXAlignment.Left
+EarnLabel.Parent = StatsFrame
+
+-- Inventory Label
+local InvLabel = Instance.new("TextLabel")
+InvLabel.Text = "\xf0\x9f\x8e\x92 Inventory: 0 ore ($0)" -- 🎒 Inventory
+InvLabel.Size = UDim2.new(1, -20, 0, 22)
+InvLabel.BackgroundTransparency = 1
+InvLabel.TextColor3 = Color3.fromRGB(180, 180, 220)
+InvLabel.Font = Enum.Font.Gotham
+InvLabel.TextSize = 13
+InvLabel.TextXAlignment = Enum.TextXAlignment.Left
+InvLabel.Parent = StatsFrame
+
+-- Status Label
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Text = "\xf0\x9f\x9f\xa2 Status: Idle" -- 🟢 Status
+StatusLabel.Size = UDim2.new(1, 0, 0, 22)
+StatusLabel.BackgroundColor3 = Color3.fromRGB(30, 30, 42)
+StatusLabel.BorderSizePixel = 0
+StatusLabel.TextColor3 = Color3.fromRGB(100, 200, 100)
+StatusLabel.Font = Enum.Font.GothamBold
+StatusLabel.TextSize = 12
+StatusLabel.LayoutOrder = 4
+StatusLabel.Parent = OreFarmPage
+
+-- Sell Button
+local SellBtn = Instance.new("TextButton")
+SellBtn.Size = UDim2.new(1, 0, 0, 35)
+SellBtn.BackgroundColor3 = Color3.fromRGB(180, 120, 20)
+SellBtn.BorderSizePixel = 0
+SellBtn.Text = "\xf0\x9f\x92\xb0 SELL ALL ORE" -- 💰 SELL
+SellBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+SellBtn.Font = Enum.Font.GothamBold
+SellBtn.TextSize = 14
+SellBtn.LayoutOrder = 5
+SellBtn.Parent = OreFarmPage
+
+local SellBtnCorner = Instance.new("UICorner")
+SellBtnCorner.CornerRadius = UDim.new(0, 8)
+SellBtnCorner.Parent = SellBtn
+
+-- Platform Toggle
+local PlatformBtn = Instance.new("TextButton")
+PlatformBtn.Size = UDim2.new(1, 0, 0, 32)
+PlatformBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+PlatformBtn.BorderSizePixel = 0
+PlatformBtn.Text = "\xf0\x9f\x9f\xa9 Platform: AUTO" -- 🟩 Platform
+PlatformBtn.TextColor3 = Color3.fromRGB(200, 200, 255)
+PlatformBtn.Font = Enum.Font.GothamBold
+PlatformBtn.TextSize = 12
+PlatformBtn.LayoutOrder = 6
+PlatformBtn.Parent = OreFarmPage
+
+local PlatBtnCorner = Instance.new("UICorner")
+PlatBtnCorner.CornerRadius = UDim.new(0, 6)
+PlatBtnCorner.Parent = PlatformBtn
+
+--// ============================================================
+--// PAGE: MOVEMENT (Fly + Noclip)
+--// ============================================================
+
+local MovementPage = Instance.new("Frame")
+MovementPage.Name = "MovementPage"
+MovementPage.Size = UDim2.new(1, 0, 1, 0)
+MovementPage.BackgroundTransparency = 1
+MovementPage.Visible = false
+MovementPage.Parent = ContentArea
+
+local moveBackBtn = createBackButton(MovementPage)
+
+local movePageLayout = Instance.new("UIListLayout")
+movePageLayout.Padding = UDim.new(0, 8)
+movePageLayout.SortOrder = Enum.SortOrder.LayoutOrder
+movePageLayout.Parent = MovementPage
+
+local moveTitle = Instance.new("TextLabel")
+moveTitle.Text = "\xf0\x9f\x9a\x80 MOVEMENT" -- 🚀 MOVEMENT
+moveTitle.Size = UDim2.new(1, 0, 0, 30)
+moveTitle.BackgroundTransparency = 1
+moveTitle.TextColor3 = Color3.fromRGB(100, 200, 255)
+moveTitle.Font = Enum.Font.GothamBold
+moveTitle.TextSize = 18
+moveTitle.LayoutOrder = 1
+moveTitle.Parent = MovementPage
+
+-- Fly Button
+local FlyBtn = Instance.new("TextButton")
+FlyBtn.Size = UDim2.new(1, 0, 0, 40)
+FlyBtn.BackgroundColor3 = Color3.fromRGB(40, 80, 160)
+FlyBtn.BorderSizePixel = 0
+FlyBtn.Text = "\xf0\x9f\x90\xa4 FLY: OFF" -- 🐤 FLY
+FlyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+FlyBtn.Font = Enum.Font.GothamBold
+FlyBtn.TextSize = 15
+FlyBtn.LayoutOrder = 2
+FlyBtn.Parent = MovementPage
+
+local FlyBtnCorner = Instance.new("UICorner")
+FlyBtnCorner.CornerRadius = UDim.new(0, 8)
+FlyBtnCorner.Parent = FlyBtn
+
+-- Fly Speed
+local SpeedFrame = Instance.new("Frame")
+SpeedFrame.Size = UDim2.new(1, 0, 0, 35)
+SpeedFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 42)
+SpeedFrame.BorderSizePixel = 0
+SpeedFrame.LayoutOrder = 3
+SpeedFrame.Parent = MovementPage
+
+local SpeedCorner = Instance.new("UICorner")
+SpeedCorner.CornerRadius = UDim.new(0, 6)
+SpeedCorner.Parent = SpeedFrame
+
+local SpeedLabel = Instance.new("TextLabel")
+SpeedLabel.Text = "\xf0\x9f\x92\xa8 Speed: 80" -- 💨 Speed
+SpeedLabel.Size = UDim2.new(0.5, 0, 1, 0)
+SpeedLabel.BackgroundTransparency = 1
+SpeedLabel.TextColor3 = Color3.fromRGB(180, 180, 220)
+SpeedLabel.Font = Enum.Font.Gotham
+SpeedLabel.TextSize = 13
+SpeedLabel.Parent = SpeedFrame
+
+local SpeedDown = Instance.new("TextButton")
+SpeedDown.Size = UDim2.new(0, 40, 0, 25)
+SpeedDown.Position = UDim2.new(0.5, 5, 0.5, -12)
+SpeedDown.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
+SpeedDown.Text = "-"
+SpeedDown.TextColor3 = Color3.fromRGB(255, 255, 255)
+SpeedDown.Font = Enum.Font.GothamBold
+SpeedDown.TextSize = 16
+SpeedDown.BorderSizePixel = 0
+SpeedDown.Parent = SpeedFrame
+
+local SpeedDownCorner = Instance.new("UICorner")
+SpeedDownCorner.CornerRadius = UDim.new(0, 4)
+SpeedDownCorner.Parent = SpeedDown
+
+local SpeedUp = Instance.new("TextButton")
+SpeedUp.Size = UDim2.new(0, 40, 0, 25)
+SpeedUp.Position = UDim2.new(1, -45, 0.5, -12)
+SpeedUp.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
+SpeedUp.Text = "+"
+SpeedUp.TextColor3 = Color3.fromRGB(255, 255, 255)
+SpeedUp.Font = Enum.Font.GothamBold
+SpeedUp.TextSize = 16
+SpeedUp.BorderSizePixel = 0
+SpeedUp.Parent = SpeedFrame
+
+local SpeedUpCorner = Instance.new("UICorner")
+SpeedUpCorner.CornerRadius = UDim.new(0, 4)
+SpeedUpCorner.Parent = SpeedUp
+
+-- Noclip Button
+local NoclipBtn = Instance.new("TextButton")
+NoclipBtn.Size = UDim2.new(1, 0, 0, 40)
+NoclipBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+NoclipBtn.BorderSizePixel = 0
+NoclipBtn.Text = "\xf0\x9f\x91\xbb NOCLIP: OFF" -- 👻 NOCLIP
+NoclipBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+NoclipBtn.Font = Enum.Font.GothamBold
+NoclipBtn.TextSize = 15
+NoclipBtn.LayoutOrder = 4
+NoclipBtn.Parent = MovementPage
+
+local NoclipBtnCorner = Instance.new("UICorner")
+NoclipBtnCorner.CornerRadius = UDim.new(0, 8)
+NoclipBtnCorner.Parent = NoclipBtn
+
+-- Fly Keybind Hint
+local FlyHint = Instance.new("TextLabel")
+FlyHint.Text = "WASD + Space/Shift to fly | V to toggle fly"
+FlyHint.Size = UDim2.new(1, 0, 0, 20)
+FlyHint.BackgroundTransparency = 1
+FlyHint.TextColor3 = Color3.fromRGB(100, 100, 140)
+FlyHint.Font = Enum.Font.Gotham
+FlyHint.TextSize = 11
+FlyHint.LayoutOrder = 5
+FlyHint.Parent = MovementPage
+
+--// ============================================================
+--// PAGE: MISC (No Fall DMG, Anti-AFK, etc.)
+--// ============================================================
+
+local MiscPage = Instance.new("Frame")
+MiscPage.Name = "MiscPage"
+MiscPage.Size = UDim2.new(1, 0, 1, 0)
+MiscPage.BackgroundTransparency = 1
+MiscPage.Visible = false
+MiscPage.Parent = ContentArea
+
+local miscBackBtn = createBackButton(MiscPage)
+
+local miscPageLayout = Instance.new("UIListLayout")
+miscPageLayout.Padding = UDim.new(0, 8)
+miscPageLayout.SortOrder = Enum.SortOrder.LayoutOrder
+miscPageLayout.Parent = MiscPage
+
+local miscTitle = Instance.new("TextLabel")
+miscTitle.Text = "\xe2\x9a\x99\xef\xb8\x8f MISC" -- ⚙️ MISC
+miscTitle.Size = UDim2.new(1, 0, 0, 30)
+miscTitle.BackgroundTransparency = 1
+miscTitle.TextColor3 = Color3.fromRGB(100, 200, 255)
+miscTitle.Font = Enum.Font.GothamBold
+miscTitle.TextSize = 18
+miscTitle.LayoutOrder = 1
+miscTitle.Parent = MiscPage
+
+-- No Fall DMG Button
+local NoFallBtn = Instance.new("TextButton")
+NoFallBtn.Size = UDim2.new(1, 0, 0, 40)
+NoFallBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+NoFallBtn.BorderSizePixel = 0
+NoFallBtn.Text = "\xf0\x9f\x9b\xa1\xef\xb8\x8f NO FALL DMG: OFF" -- 🛡️ NO FALL DMG
+NoFallBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+NoFallBtn.Font = Enum.Font.GothamBold
+NoFallBtn.TextSize = 15
+NoFallBtn.LayoutOrder = 2
+NoFallBtn.Parent = MiscPage
+
+local NoFallBtnCorner = Instance.new("UICorner")
+NoFallBtnCorner.CornerRadius = UDim.new(0, 8)
+NoFallBtnCorner.Parent = NoFallBtn
+
+-- Anti-AFK Button
+local AntiAFKBtn = Instance.new("TextButton")
+AntiAFKBtn.Size = UDim2.new(1, 0, 0, 40)
+AntiAFKBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 35)
+AntiAFKBtn.BorderSizePixel = 0
+AntiAFKBtn.Text = "\xe2\x98\x95 ANTI-AFK: ON" -- ☕ ANTI-AFK
+AntiAFKBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+AntiAFKBtn.Font = Enum.Font.GothamBold
+AntiAFKBtn.TextSize = 15
+AntiAFKBtn.LayoutOrder = 3
+AntiAFKBtn.Parent = MiscPage
+
+local AntiAFKBtnCorner = Instance.new("UICorner")
+AntiAFKBtnCorner.CornerRadius = UDim.new(0, 8)
+AntiAFKBtnCorner.Parent = AntiAFKBtn
+
+--// ============================================================
+--// PAGE NAVIGATION
+--// ============================================================
+
+local function showPage(pageName)
+    for _, page in ipairs(ContentArea:GetChildren()) do
+        if page:IsA("Frame") and page.Name:find("Page") then
+            page.Visible = (page.Name == pageName)
         end
-        task.wait(1)
+    end
+end
+
+-- Tab button clicks
+oreFarmTab.MouseButton1Click:Connect(function()
+    showPage("OreFarmPage")
+end)
+
+flyTab.MouseButton1Click:Connect(function()
+    showPage("MovementPage")
+end)
+
+miscTab.MouseButton1Click:Connect(function()
+    showPage("MiscPage")
+end)
+
+-- Back button clicks
+oreBackBtn.MouseButton1Click:Connect(function()
+    showPage("HomePage")
+end)
+
+moveBackBtn.MouseButton1Click:Connect(function()
+    showPage("HomePage")
+end)
+
+miscBackBtn.MouseButton1Click:Connect(function()
+    showPage("HomePage")
+end)
+
+-- Start on Home page
+showPage("HomePage")
+
+--// ============================================================
+--// BUTTON LOGIC
+--// ============================================================
+
+-- Farm Button
+FarmBtn.MouseButton1Click:Connect(function()
+    if isFarming then
+        stopFarming()
+        FarmBtn.Text = "\xe2\x9b\x8f\xef\xb8\x8f START FARM" -- ⛏️ START FARM
+        FarmBtn.BackgroundColor3 = Color3.fromRGB(40, 120, 40)
+        StatusLabel.Text = "\xf0\x9f\x9f\xa1 Status: Stopped" -- 🟡
+        StatusLabel.TextColor3 = Color3.fromRGB(200, 200, 50)
+    else
+        startFarming()
+        FarmBtn.Text = "\xe2\x9b\x8f\xef\xb8\x8f STOP FARM" -- ⛏️ STOP FARM
+        FarmBtn.BackgroundColor3 = Color3.fromRGB(160, 40, 40)
+        StatusLabel.Text = "\xf0\x9f\x9f\xa2 Status: Farming..." -- 🟢
+        StatusLabel.TextColor3 = Color3.fromRGB(100, 200, 100)
     end
 end)
 
--- ═══════════════ CHARACTER RESPAWN ═══════════════
+-- Sell Button
+SellBtn.MouseButton1Click:Connect(function()
+    if not isFarming then
+        local inv = countInventoryItems()
+        local earnings = calculateEarnings(inv)
+        if getTotalOreCount(inv) > 0 then
+            totalEarnings = totalEarnings + earnings
+            currentSessionEarnings = currentSessionEarnings + earnings
+            sellAllOre()
+            StatusLabel.Text = "\xf0\x9f\x92\xb0 Sold ore!" -- 💰
+            StatusLabel.TextColor3 = Color3.fromRGB(255, 200, 50)
+            wait(1)
+            StatusLabel.Text = "\xf0\x9f\x9f\xa2 Status: Idle" -- 🟢
+        end
+    end
+end)
+
+-- Platform Toggle
+local platformMode = 0 -- 0=AUTO, 1=ON, 2=OFF
+PlatformBtn.MouseButton1Click:Connect(function()
+    platformMode = (platformMode + 1) % 3
+    if platformMode == 0 then
+        PlatformBtn.Text = "\xf0\x9f\x9f\xa9 Platform: AUTO" -- 🟩
+    elseif platformMode == 1 then
+        PlatformBtn.Text = "\xf0\x9f\x9f\xa9 Platform: ON" -- 🟩
+        -- Force platform on
+        local hrp = getHRP()
+        if hrp then createPlatform(hrp.Position) end
+    else
+        PlatformBtn.Text = "\xf0\x9f\x94\xb4 Platform: OFF" -- 🔴
+        removePlatform()
+    end
+end)
+
+-- Fly Button
+FlyBtn.MouseButton1Click:Connect(function()
+    toggleFly()
+    if isFlying then
+        FlyBtn.Text = "\xf0\x9f\x90\xa4 FLY: ON" -- 🐤 FLY ON
+        FlyBtn.BackgroundColor3 = Color3.fromRGB(20, 120, 200)
+    else
+        FlyBtn.Text = "\xf0\x9f\x90\xa4 FLY: OFF" -- 🐤 FLY OFF
+        FlyBtn.BackgroundColor3 = Color3.fromRGB(40, 80, 160)
+    end
+end)
+
+-- Fly Speed
+SpeedDown.MouseButton1Click:Connect(function()
+    flySpeed = math.max(10, flySpeed - 10)
+    SpeedLabel.Text = "\xf0\x9f\x92\xa8 Speed: " .. flySpeed -- 💨
+end)
+
+SpeedUp.MouseButton1Click:Connect(function()
+    flySpeed = math.min(300, flySpeed + 10)
+    SpeedLabel.Text = "\xf0\x9f\x92\xa8 Speed: " .. flySpeed -- 💨
+end)
+
+-- Noclip Button
+NoclipBtn.MouseButton1Click:Connect(function()
+    toggleNoclip(not isNoclipping)
+    if isNoclipping then
+        NoclipBtn.Text = "\xf0\x9f\x91\xbb NOCLIP: ON" -- 👻 ON
+        NoclipBtn.BackgroundColor3 = Color3.fromRGB(120, 40, 120)
+    else
+        NoclipBtn.Text = "\xf0\x9f\x91\xbb NOCLIP: OFF" -- 👻 OFF
+        NoclipBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+    end
+end)
+
+-- No Fall DMG Button
+NoFallBtn.MouseButton1Click:Connect(function()
+    toggleNoFallDMG(not isNoFallDmg)
+    if isNoFallDmg then
+        NoFallBtn.Text = "\xf0\x9f\x9b\xa1\xef\xb8\x8f NO FALL DMG: ON" -- 🛡️ ON
+        NoFallBtn.BackgroundColor3 = Color3.fromRGB(20, 120, 60)
+    else
+        NoFallBtn.Text = "\xf0\x9f\x9b\xa1\xef\xb8\x8f NO FALL DMG: OFF" -- 🛡️ OFF
+        NoFallBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+    end
+end)
+
+-- Anti-AFK Button (starts ON)
+startAntiAFK()
+AntiAFKBtn.MouseButton1Click:Connect(function()
+    if antiAFKConn then
+        antiAFKConn:Disconnect()
+        antiAFKConn = nil
+        AntiAFKBtn.Text = "\xe2\x98\x95 ANTI-AFK: OFF" -- ☕ OFF
+        AntiAFKBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+    else
+        startAntiAFK()
+        AntiAFKBtn.Text = "\xe2\x98\x95 ANTI-AFK: ON" -- ☕ ON
+        AntiAFKBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 35)
+    end
+end)
+
+--// Minimize Toggle
+local isMinimized = false
+MinBtn.MouseButton1Click:Connect(function()
+    isMinimized = not isMinimized
+    ContentArea.Visible = not isMinimized
+    if isMinimized then
+        MainFrame.Size = UDim2.new(0, 380, 0, 40)
+    else
+        MainFrame.Size = UDim2.new(0, 380, 0, 520)
+    end
+end)
+
+--// V key to toggle fly
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.V then
+        toggleFly()
+        if isFlying then
+            FlyBtn.Text = "\xf0\x9f\x90\xa4 FLY: ON" -- 🐤 ON
+            FlyBtn.BackgroundColor3 = Color3.fromRGB(20, 120, 200)
+        else
+            FlyBtn.Text = "\xf0\x9f\x90\xa4 FLY: OFF" -- 🐤 OFF
+            FlyBtn.BackgroundColor3 = Color3.fromRGB(40, 80, 160)
+        end
+    end
+end)
+
+--// ============================================================
+--// STATS UPDATE LOOP
+--// ============================================================
+
+RunService.Heartbeat:Connect(function()
+    if isFarming then
+        local elapsed = tick() - farmStartTime
+        TimeLabel.Text = "\xe2\x8f\xb1\xef\xb8\x8f Time: " .. formatTime(elapsed) -- ⏱️
+        OreLabel.Text = "\xf0\x9f\xaa\xa8 Ore Mined: " .. totalOreMined -- 🪨
+        EarnLabel.Text = "\xf0\x9f\x92\xb0 Earnings: $" .. totalEarnings -- 💰
+
+        local inv = countInventoryItems()
+        local invCount = getTotalOreCount(inv)
+        local invValue = calculateEarnings(inv)
+        InvLabel.Text = "\xf0\x9f\x8e\x92 Inventory: " .. invCount .. " ore ($" .. invValue .. ")" -- 🎒
+    else
+        -- Show frozen values
+        TimeLabel.Text = "\xe2\x8f\xb1\xef\xb8\x8f Time: " .. frozenTimeStr -- ⏱️
+        OreLabel.Text = "\xf0\x9f\xaa\xa8 Ore Mined: " .. (frozenOreCount > 0 and frozenOreCount or totalOreMined) -- 🪨
+        EarnLabel.Text = "\xf0\x9f\x92\xb0 Earnings: $" .. (frozenEarnings > 0 and frozenEarnings or totalEarnings) -- 💰
+
+        local inv = countInventoryItems()
+        local invCount = getTotalOreCount(inv)
+        local invValue = calculateEarnings(inv)
+        InvLabel.Text = "\xf0\x9f\x8e\x92 Inventory: " .. invCount .. " ore ($" .. invValue .. ")" -- 🎒
+    end
+end)
+
+--// Character respawn handling
 LocalPlayer.CharacterAdded:Connect(function(char)
     Character = char
     Humanoid = char:WaitForChild("Humanoid")
-    RootPart = char:WaitForChild("HumanoidRootPart")
-    if dmgBlocked then
-        dmgBlocked = false
-        task.wait(1)
-        enableDmgBlock()
+    HumanoidRootPart = char:WaitForChild("HumanoidRootPart")
+
+    -- Stop farming on death
+    if isFarming then
+        stopFarming()
+        FarmBtn.Text = "\xe2\x9b\x8f\xef\xb8\x8f START FARM" -- ⛏️
+        FarmBtn.BackgroundColor3 = Color3.fromRGB(40, 120, 40)
+        StatusLabel.Text = "\xf0\x9f\x94\xb4 Status: Died - Stopped" -- 🔴
+        StatusLabel.TextColor3 = Color3.fromRGB(200, 50, 50)
     end
+
+    -- Stop fly
+    if isFlying then
+        stopFly()
+        FlyBtn.Text = "\xf0\x9f\x90\xa4 FLY: OFF" -- 🐤
+        FlyBtn.BackgroundColor3 = Color3.fromRGB(40, 80, 160)
+    end
+
+    removePlatform()
 end)
 
--- ═══════════════ INIT ═══════════════
-createGui()
-print("[AI Script v0.02] Loaded!")
+print("[AI Script v0.01] Loaded successfully!")
