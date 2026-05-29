@@ -24,7 +24,7 @@ local CAVE_POS = Vector3.new(-424, -8, 246)
 local ROCKS_PARENT_PATH = "Tasks.Prisoner.Rocks"
 local MINERAL_BUYER_NAME = "Mineral Buyer"
 local MINING_DISTANCE = 5
-local HIT_INTERVAL = 0.80
+local HIT_INTERVAL = 0.45
 local SELL_INTERVAL = 2
 
 --// Ore Prices
@@ -529,35 +529,20 @@ end
 
 local farmThread = nil
 
-local function isRockActuallyThere(rock)
-    -- More thorough check than isRockValid
-    if not rock then return false end
-    if rock.Parent == nil then return false end
-    if not Workspace:IsAncestorOf(rock) then return false end
-    if not rock:IsA("BasePart") then return false end
-    -- Check if rock is invisible/destroyed on server side
-    if rock.Transparency >= 1 then return false end
-    -- Check if rock has been resized to nothing
-    if rock.Size.Magnitude < 1 then return false end
-    return true
-end
-
 local function farmLoop()
     while isFarming do
         -- Find nearest rock (skip already mined ones)
         local rock, dist = findNearestRock(minedRocks)
 
         if not rock then
-            -- All rocks mined or no rocks found, clear cache and wait for respawn
+            -- All rocks mined, reset cache and wait
             minedRocks = {}
-            wait(3)
+            wait(2)
             continue
         end
 
-        -- Double check rock is actually there
-        if not isRockActuallyThere(rock) then
+        if not isRockValid(rock) then
             table.insert(minedRocks, rock)
-            wait(0.5)
             continue
         end
 
@@ -573,28 +558,16 @@ local function farmLoop()
         if distToCave > 200 then
             teleportTo(CAVE_POS)
             wait(0.5)
-            hrp = getHRP()
         end
 
         -- Position: stand 5 studs from rock, looking at it
         local rockPos = rock.Position
         local direction = (hrp.Position - rockPos).Unit
-        if direction.Magnitude < 0.01 then
-            direction = Vector3.new(1, 0, 0)
-        end
         local standPos = rockPos + (direction * MINING_DISTANCE)
         standPos = Vector3.new(standPos.X, rockPos.Y + 3, standPos.Z)
 
         teleportTo(standPos)
         wait(0.3)
-
-        -- Re-verify rock after TP (it might have disappeared during TP)
-        if not isRockActuallyThere(rock) then
-            table.insert(minedRocks, rock)
-            removePlatform()
-            wait(0.5)
-            continue
-        end
 
         -- Create platform under player
         createPlatform(hrp.Position)
@@ -609,14 +582,17 @@ local function farmLoop()
 
         -- Mine the rock
         local hitCount = 0
-        local maxHits = 30 -- Safety timeout (~13 seconds at 0.45 interval)
-        local noProgressHits = 0
-        local oreBefore = getTotalOreCount(countInventoryItems())
+        local maxHits = 60 -- Safety timeout (15 seconds at 0.45 interval)
 
-        while isFarming and isRockActuallyThere(rock) and hitCount < maxHits do
-            -- Track inventory before this hit
-            local invBeforeHit = countInventoryItems()
-            local oreBeforeHit = getTotalOreCount(invBeforeHit)
+        while isFarming and isRockValid(rock) and hitCount < maxHits do
+            -- Check if rock still exists
+            if rock.Parent == nil or not Workspace:IsAncestorOf(rock) then
+                break
+            end
+
+            -- Track inventory before hit
+            local invBefore = countInventoryItems()
+            local oreBefore = getTotalOreCount(invBefore)
 
             -- Mine
             mineRock(rock)
@@ -624,38 +600,15 @@ local function farmLoop()
 
             wait(HIT_INTERVAL)
 
-            -- Check if rock was destroyed/removed during hit
-            if rock.Parent == nil or not Workspace:IsAncestorOf(rock) then
-                break
-            end
-
             -- Check if ore appeared in inventory (rock broken)
             local invAfter = countInventoryItems()
             local oreAfter = getTotalOreCount(invAfter)
 
-            if oreAfter > oreBeforeHit then
+            if oreAfter > oreBefore then
                 -- Rock broken!
-                totalOreMined = totalOreMined + (oreAfter - oreBeforeHit)
-                currentSessionOre = currentSessionOre + (oreAfter - oreBeforeHit)
+                totalOreMined = totalOreMined + (oreAfter - oreBefore)
+                currentSessionOre = currentSessionOre + (oreAfter - oreBefore)
                 break
-            end
-
-            -- No ore from this hit - check if rock might be ghost
-            noProgressHits = noProgressHits + 1
-            if noProgressHits >= 10 then
-                -- 10 hits with no ore = probably mining empty space
-                -- Re-validate the rock
-                if not isRockActuallyThere(rock) then
-                    break
-                end
-                -- If inventory hasn't changed at all since we started this rock, skip it
-                local currentOre = getTotalOreCount(countInventoryItems())
-                if currentOre <= oreBefore then
-                    -- No progress at all, rock is probably ghost/broken on server
-                    break
-                end
-                -- Reset counter if we had some progress
-                noProgressHits = 0
             end
         end
 
@@ -678,7 +631,8 @@ local function farmLoop()
             sellAllOre()
         end
 
-        wait(0.2)
+        -- Update platform position for next rock
+        wait(0.1)
     end
 
     -- Clean up
@@ -1253,22 +1207,6 @@ local AntiAFKBtnCorner = Instance.new("UICorner")
 AntiAFKBtnCorner.CornerRadius = UDim.new(0, 8)
 AntiAFKBtnCorner.Parent = AntiAFKBtn
 
--- Rejoin Button
-local RejoinBtn = Instance.new("TextButton")
-RejoinBtn.Size = UDim2.new(1, 0, 0, 40)
-RejoinBtn.BackgroundColor3 = Color3.fromRGB(160, 50, 50)
-RejoinBtn.BorderSizePixel = 0
-RejoinBtn.Text = "\xf0\x9f\x94\x84 REJOIN" -- 🔄 REJOIN
-RejoinBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-RejoinBtn.Font = Enum.Font.GothamBold
-RejoinBtn.TextSize = 15
-RejoinBtn.LayoutOrder = 4
-RejoinBtn.Parent = MiscPage
-
-local RejoinBtnCorner = Instance.new("UICorner")
-RejoinBtnCorner.CornerRadius = UDim.new(0, 8)
-RejoinBtnCorner.Parent = RejoinBtn
-
 --// ============================================================
 --// PAGE NAVIGATION
 --// ============================================================
@@ -1425,14 +1363,6 @@ AntiAFKBtn.MouseButton1Click:Connect(function()
         AntiAFKBtn.Text = "\xe2\x98\x95 ANTI-AFK: ON" -- ☕ ON
         AntiAFKBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 35)
     end
-end)
-
--- Rejoin Button
-RejoinBtn.MouseButton1Click:Connect(function()
-    local ts = game:GetService("TeleportService")
-    pcall(function()
-        ts:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
-    end)
 end)
 
 --// Minimize Toggle
