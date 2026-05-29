@@ -1,13 +1,12 @@
 --[[
-    AI Script v0.20
+    AI Script v0.25
     Game: UGC Prison (Place ID: 102718061120016)
-    v0.20: Trash farm rewritten with correct remotes (Prompt.Interact.Event).
-           Deposit remote: Recyclement Room bin.
-           Earnings counter for trash. Default bin position set.
-           Spam head/blink button (UnreliableReplicationEvent).
-           Infinite hunger/thirst auto-finds by name.
-    v0.19: Auto trash collection. Staff alert blocks other sounds.
-    v0.17: Removed SPY button. Default click delay 0.6s.
+    v0.25: Fixed trash farm — bin floor spot (-120,-57,-412), no offset teleport,
+           pickup/deposit 3x retry, teleport to trash without height offset.
+    v0.22: Hunger/Thirst = Player:SetAttribute. Staff alert: no sound, visual only.
+           Spam Head + Head In Body in MISC. Removed Dump Game Values.
+    v0.21: Trash detection: Transparency=0 + Prompt.Enabled=true.
+    v0.20: Trash farm with correct remotes. Spam head/blink. Earnings counter.
     v0.15: task.wait delay approach for pull-ups
 ]]
 
@@ -95,7 +94,7 @@ local S = {
     -- Trash collection
     isTrashFarming = false,
     trashFarmThread = nil,
-    trashBinPos = Vector3.new(-115.4, -54.3, -408.2),  -- Recyclement Room bin
+    trashBinPos = Vector3.new(-120, -57, -412),  -- Floor spot LEFT of bin in Recyclement Room
     trashReturnPos = nil,       -- Vector3, return here after all trash collected
     trashCollected = 0,
     trashTotal = 0,
@@ -106,13 +105,15 @@ local S = {
     isSpammingHead = false,
     spamHeadConn = nil,
 
+    -- Head in body
+    isHeadInBody = false,
+    headInBodyConn = nil,
+
     keybinds = {},
     listeningForBind = nil,
 
     lastNotifTime = 0,
     NOTIF_COOLDOWN = 3,
-
-    _isAlertPlaying = false,   -- staff alert sound playing flag
 
     Pages = {},
     Buttons = {},
@@ -330,30 +331,19 @@ do
 end
 
 --// ============================================================
---// HOOKMETAMETHOD: No Fall DMG + Block sounds during staff alert
+--// HOOKMETAMETHOD: No Fall DMG
 --// ============================================================
--- Uses hookmetamethod to intercept __namecall:
---   1. Block DamageEvent:FireServer() when No Fall DMG is enabled.
---   2. Block Sound:Play() for non-alert sounds during staff alert.
--- The hook is always installed but only blocks when flags are on.
+-- Uses hookmetamethod to intercept __namecall and block
+-- DamageEvent:FireServer() when No Fall DMG is enabled.
 --//=============================================================
 do
     local DamageEvent = S.ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("DamageEvent")
-    local ALERT_SOUND_ID = "rbxassetid://132238052138705"
     local oldNamecall = nil
 
-    -- Install the hook once (always active, checks flags internally)
     oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
         local method = getnamecallmethod()
-        -- Block fall damage
         if method == "FireServer" and self == DamageEvent and S.isNoFallDmg then
             return
-        end
-        -- Block other sounds during staff alert (only allow our alert sound)
-        if method == "Play" and S._isAlertPlaying then
-            if typeof(self) == "Instance" and self:IsA("Sound") and self.SoundId ~= ALERT_SOUND_ID then
-                return  -- Block this sound from playing during alert
-            end
         end
         return oldNamecall(self, ...)
     end))
@@ -1296,7 +1286,7 @@ do
 end
 
 --// ============================================================
---// STAFF DETECTION (NewPlayerGroupDetails)
+--// STAFF DETECTION (NewPlayerGroupDetails + AnnouncementEvent)
 --// ============================================================
 do
     local DANGEROUS_ROLES = { Admin = true, PlaceCreator = true, Intern = true, Star = true }
@@ -1306,63 +1296,31 @@ do
         return ok and name or tostring(userId)
     end
 
-    -- ALERT SOUND: User's verified sound. Plays 3 times.
-    -- Uses S._isAlertPlaying so the hookmetamethod can block other sounds during alert.
-    local function playAlertSound()
-        if S._isAlertPlaying then return end
-        S._isAlertPlaying = true
-
-        -- Immediately stop any currently playing sounds that aren't ours
-        local ALERT_ID = "rbxassetid://132238052138705"
-        pcall(function()
-            for _, svc in ipairs({S.Workspace.CurrentCamera, game:GetService("SoundService")}) do
-                for _, s in ipairs(svc:GetChildren()) do
-                    if s:IsA("Sound") and s.IsPlaying and s.SoundId ~= ALERT_ID then
-                        s:Stop()
-                    end
-                end
-            end
-        end)
-        pcall(function()
-            local pg = S.LocalPlayer:FindFirstChild("PlayerGui")
-            if pg then
-                for _, desc in ipairs(pg:GetDescendants()) do
-                    if desc:IsA("Sound") and desc.IsPlaying and desc.SoundId ~= ALERT_ID then
-                        desc:Stop()
-                    end
-                end
-            end
-        end)
-
-        task.spawn(function()
-            pcall(function()
-                for i = 1, 3 do
-                    local sound = Instance.new("Sound")
-                    sound.SoundId = ALERT_ID
-                    sound.Volume = 3
-                    sound.Looped = false
-                    sound.Parent = S.Workspace.CurrentCamera
-                    if not sound.IsLoaded then
-                        sound.Loaded:Wait()
-                    end
-                    sound:Play()
-                    sound.Ended:Wait()
-                    sound:Destroy()
-                    if i < 3 then task.wait(0.3) end
-                end
-            end)
-
-            S._isAlertPlaying = false
-        end)
-    end
-
+    -- Send staff alert notification (no sound, just visual)
     local function onStaffDetected(userId, roles)
-        playAlertSound()
+        local name = getPlayerNameById(userId)
+        local roleStr = table.concat(roles, ", ")
+
+        -- 1. Game notification
+        S.sendNotif("STAFF: " .. name .. " [" .. roleStr .. "]")
+
+        -- 2. Announcement popup (same as game uses for Staff announcements)
+        pcall(function()
+            local announcementEvent = S.ReplicatedStorage:FindFirstChild("Remotes")
+                and S.ReplicatedStorage.Remotes:FindFirstChild("AnnouncementEvent")
+            if announcementEvent and announcementEvent:IsA("RemoteEvent") then
+                firesignal(announcementEvent.OnClientEvent, {
+                    Origin = "Staff",
+                    Sender = name,
+                    Message = "Roles: " .. roleStr
+                })
+            end
+        end)
     end
 
+    -- Listen to NewPlayerGroupDetails (role detection)
     pcall(function()
         local RobloxReplicatedStorage = game:GetService("RobloxReplicatedStorage")
-        -- Use FindFirstChild instead of WaitForChild to prevent blocking/crash
         local remote = RobloxReplicatedStorage:FindFirstChild("NewPlayerGroupDetails")
         if remote and remote:IsA("RemoteEvent") then
             remote.OnClientEvent:Connect(function(data)
@@ -1421,26 +1379,34 @@ do
         return interact:FindFirstChild("Event")
     end
 
-    -- Find all available trash MeshParts directly in Trashes folder
+    -- Find all AVAILABLE trash objects (Transparency=0 + Prompt.Enabled=true)
     local function findAllTrash()
         local trashes = getTrashesParent()
         if not trashes then return {} end
         local result = {}
         for _, trashObj in ipairs(trashes:GetChildren()) do
-            if trashObj:IsA("BasePart") or trashObj:IsA("Model") then
-                -- Check if it has the Interact remote (means it's collectible)
-                local hasRemote = false
+            if trashObj:IsA("BasePart") then
+                -- Available = Transparency=0 AND Prompt exists with Interact
+                local isAvailable = false
                 pcall(function()
-                    hasRemote = trashObj:FindFirstChild("Prompt")
-                        and trashObj.Prompt:FindFirstChild("Interact")
-                        and trashObj.Prompt.Interact:FindFirstChild("Event")
+                    -- Check transparency first
+                    if trashObj.Transparency >= 1 then return end
+                    -- Check if Prompt.Interact.Event exists (means it's available)
+                    local prompt = trashObj:FindFirstChild("Prompt")
+                    if not prompt then return end
+                    local interact = prompt:FindFirstChild("Interact")
+                    if not interact then return end
+                    local evt = interact:FindFirstChild("Event")
+                    if not evt then return end
+                    -- Also check Enabled attribute on Prompt config
+                    local enabledAttr = prompt:GetAttribute("Enabled")
+                    if enabledAttr == false then return end
+                    -- If there's a ProximityPrompt, check its Enabled property too
+                    local proxPrompt = trashObj:FindFirstChildOfClass("ProximityPrompt")
+                    if proxPrompt and not proxPrompt.Enabled then return end
+                    isAvailable = true
                 end)
-                -- Check if visible/not collected
-                local visible = true
-                if trashObj:IsA("BasePart") then
-                    visible = trashObj.Transparency < 1
-                end
-                if visible or hasRemote then
+                if isAvailable then
                     table.insert(result, trashObj)
                 end
             end
@@ -1470,29 +1436,30 @@ do
         end)
     end
 
-    -- Get player's current money
+    -- Get player's current money (Player.Stats.Money)
     local function getPlayerMoney()
         local money = 0
         pcall(function()
-            for _, desc in ipairs(S.LocalPlayer:GetDescendants()) do
-                if (desc:IsA("NumberValue") or desc:IsA("IntValue")) and desc.Name:lower():find("money") then
-                    money = desc.Value
-                    break
+            local stats = S.LocalPlayer:FindFirstChild("Stats")
+            if stats then
+                local m = stats:FindFirstChild("Money")
+                if m and (m:IsA("NumberValue") or m:IsA("IntValue")) then
+                    money = m.Value
+                    return
                 end
             end
         end)
-        -- Also try leaderstats
-        pcall(function()
-            local ls = S.LocalPlayer:FindFirstChild("leaderstats")
-            if ls then
-                for _, v in ipairs(ls:GetChildren()) do
-                    if v.Name:lower():find("money") or v.Name:lower():find("cash") or v.Name == "Money" then
-                        money = v.Value
+        -- Fallback: search descendants
+        if money == 0 then
+            pcall(function()
+                for _, desc in ipairs(S.LocalPlayer:GetDescendants()) do
+                    if (desc:IsA("NumberValue") or desc:IsA("IntValue")) and desc.Name == "Money" then
+                        money = desc.Value
                         break
                     end
                 end
-            end
-        end)
+            end)
+        end
         return money
     end
 
@@ -1511,79 +1478,85 @@ do
         end
 
         S.trashFarmThread = task.spawn(function()
-            while S.isTrashFarming do
-                local trashList = findAllTrash()
-                S.trashTotal = #trashList
-
-                if #trashList == 0 then
-                    -- No trash left, wait for respawn
-                    S.sendNotif("All trash collected! Waiting 15s for respawn...")
-                    task.wait(15)
-                    -- Re-check
-                    trashList = findAllTrash()
+            local ok, err = pcall(function()
+                while S.isTrashFarming do
+                    local trashList = findAllTrash()
                     S.trashTotal = #trashList
+
                     if #trashList == 0 then
-                        -- Still nothing, try one more time
+                        -- No trash left, wait for respawn
+                        S.sendNotif("All trash collected! Waiting 15s...")
                         task.wait(15)
                         trashList = findAllTrash()
                         S.trashTotal = #trashList
                         if #trashList == 0 then
-                            -- Calculate earnings
-                            S.trashEarnings = getPlayerMoney() - S.trashSessionStartMoney
-                            -- Return to start
-                            if S.trashReturnPos then
-                                S.teleportTo(S.trashReturnPos)
+                            task.wait(15)
+                            trashList = findAllTrash()
+                            S.trashTotal = #trashList
+                            if #trashList == 0 then
+                                S.trashEarnings = getPlayerMoney() - S.trashSessionStartMoney
+                                if S.trashReturnPos then
+                                    S.teleportTo(S.trashReturnPos)
+                                end
+                                S.sendNotif("No more trash! Earned: $" .. S.trashEarnings)
+                                S.isTrashFarming = false
+                                break
                             end
-                            S.sendNotif("No more trash! Earned: $" .. S.trashEarnings)
-                            S.isTrashFarming = false
-                            break
                         end
                     end
-                end
 
-                -- Process each trash object
-                for _, trashObj in ipairs(trashList) do
-                    if not S.isTrashFarming then break end
+                    -- Process each trash object
+                    for _, trashObj in ipairs(trashList) do
+                        if not S.isTrashFarming then break end
 
-                    -- 1. Teleport to trash
-                    local trashPos = nil
-                    if trashObj:IsA("BasePart") then trashPos = trashObj.Position end
-                    if not trashPos and trashObj:IsA("Model") and trashObj.PrimaryPart then
-                        trashPos = trashObj.PrimaryPart.Position
-                    end
-                    if not trashPos then continue end
+                        -- 1. Teleport to trash
+                        local trashPos = nil
+                        pcall(function()
+                            if trashObj:IsA("BasePart") then trashPos = trashObj.Position end
+                            if not trashPos and trashObj:IsA("Model") and trashObj.PrimaryPart then
+                                trashPos = trashObj.PrimaryPart.Position
+                            end
+                        end)
+                        if not trashPos then continue end
 
-                    S.teleportTo(trashPos + Vector3.new(0, 3, 0))
-                    task.wait(0.4)
-
-                    -- 2. Pick up trash (fire remote, no need to hold)
-                    pickupTrash(trashObj)
-                    task.wait(0.4)
-
-                    -- 3. Teleport to bin and deposit
-                    if S.trashBinPos then
-                        S.teleportTo(S.trashBinPos + Vector3.new(0, 3, 0))
-                        task.wait(0.4)
-                        depositTrash()
+                        S.teleportTo(trashPos + Vector3.new(0, 0, 0))
                         task.wait(0.5)
+
+                        -- 2. Pick up trash (fire remote, no need to hold)
+                        -- Try multiple times for reliability
+                        for attempt = 1, 3 do
+                            pickupTrash(trashObj)
+                            task.wait(0.3)
+                        end
+                        task.wait(0.3)
+
+                        -- 3. Teleport to bin floor spot and deposit
+                        S.teleportTo(S.trashBinPos)
+                        task.wait(0.8)
+                        -- Try deposit multiple times
+                        for attempt = 1, 3 do
+                            depositTrash()
+                            task.wait(0.3)
+                        end
+                        task.wait(0.3)
                         S.trashCollected = S.trashCollected + 1
-                    else
-                        S.sendNotif("No bin position set! Stand at bin and press SET BIN POS.")
-                        S.isTrashFarming = false
-                        break
                     end
+
+                    -- Update earnings
+                    S.trashEarnings = getPlayerMoney() - S.trashSessionStartMoney
+
+                    -- Brief pause before next cycle
+                    task.wait(1)
                 end
+            end)
 
-                -- Update earnings
-                S.trashEarnings = getPlayerMoney() - S.trashSessionStartMoney
-
-                -- Brief pause before next cycle
-                task.wait(1)
+            if not ok then
+                warn("[AI] Trash farm error: " .. tostring(err))
+                S.sendNotif("Trash farm error! Check F9")
             end
 
             -- Final earnings calculation
             S.trashEarnings = getPlayerMoney() - S.trashSessionStartMoney
-            -- Return to start position
             if S.trashReturnPos and not S.isTrashFarming then
                 S.teleportTo(S.trashReturnPos)
             end
@@ -1652,6 +1625,53 @@ do
                 S.spamHeadConn = nil
             end
             S.sendNotif("Spam Head: OFF")
+        end
+    end
+end
+
+--// ============================================================
+--// HEAD IN BODY (Move neck CFrame to zero = head inside torso)
+--// ============================================================
+do
+    local ReplicationEvent = S.ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("UnreliableReplicationEvent")
+
+    function S.toggleHeadInBody(enable)
+        if enable then
+            S.isHeadInBody = true
+            if S.headInBodyConn then S.headInBodyConn:Disconnect() end
+
+            S.headInBodyConn = S.RunService.Heartbeat:Connect(function()
+                if not S.isHeadInBody then return end
+                pcall(function()
+                    local char = S.getCharacter()
+                    if not char then return end
+                    local torso = char:FindFirstChild("Torso")
+                    if not torso then return end
+                    local neck = torso:FindFirstChild("Neck")
+                    if not neck then return end
+
+                    -- Full 180° rotation: head flipped down into the torso
+                    -- C0 = offset from torso, C1 = offset from head
+                    -- Default neck C0 is roughly (0, 0.8, 0) * angle
+                    -- To put head fully inside: rotate 180° on X axis + move down
+                    local insideCF = CFrame.new(0, 0.5, 0) * CFrame.Angles(math.rad(180), 0, 0)
+
+                    pcall(function()
+                        ReplicationEvent:FireServer("MoveNeck", {
+                            Motor = neck,
+                            NewCF = insideCF,
+                        })
+                    end)
+                end)
+            end)
+            S.sendNotif("Head In Body: ON")
+        else
+            S.isHeadInBody = false
+            if S.headInBodyConn then
+                S.headInBodyConn:Disconnect()
+                S.headInBodyConn = nil
+            end
+            S.sendNotif("Head In Body: OFF")
         end
     end
 end
@@ -1922,9 +1942,7 @@ do
     pageTitle(TrashPage, "TRASH COLLECTOR")
 
     local TrashFarmBtn = createToggle(TrashPage, "🗑️ START TRASH FARM", C_GREEN, 2)
-    local SetBinBtn = createToggle(TrashPage, "📍 SET BIN POS (stand at bin)", C_CARD, 3)
-    do local s = Instance.new("UIStroke") s.Color = C_BORDER s.Thickness = 1 s.Parent = SetBinBtn end
-    local SpamHeadBtn = createToggle(TrashPage, "🤪 SPAM HEAD/BLINK", C_PURPLE, 5)
+    -- Bin position is hardcoded: Vector3.new(-115.4, -54.3, -408.2)
 
     -- Trash stats
     local TrashStatsFrame = Instance.new("Frame")
@@ -1937,7 +1955,7 @@ do
     local TrashCountLabel = statLabel(TrashStatsFrame, "Collected: 0")
     local TrashAvailLabel = statLabel(TrashStatsFrame, "Available: 0")
     local TrashEarnLabel = statLabel(TrashStatsFrame, "Earned: $0")
-    local TrashBinLabel = statLabel(TrashStatsFrame, "Bin: -115, -54, -408")
+    local TrashBinLabel = statLabel(TrashStatsFrame, "Bin: -120, -57, -412")
 
     -- ============ PAGE: OTHERS AUTO ============
     local OthersPage = Instance.new("Frame")
@@ -2031,10 +2049,8 @@ do
     local NoFallBtn = createToggle(MiscPage, "❤️ NO FALL DMG: OFF", C_RED, 2)
     local AntiAFKBtn = createToggle(MiscPage, "🛡️ ANTI-AFK: OFF", C_RED, 3)
     local HungerBtn = createToggle(MiscPage, "🍖 INF HUNGER/THIRST: OFF", C_RED, 4)
-    local DumpBtn = createToggle(MiscPage, "🔍 DUMP GAME VALUES", C_PURPLE, 5)
-    do local h = Instance.new("TextLabel") h.Text = "Dump prints all values to F9 console" h.Size = UDim2.new(1, 0, 0, 14)
-       h.BackgroundTransparency = 1 h.TextColor3 = Color3.fromRGB(100, 70, 70) h.Font = Enum.Font.Gotham
-       h.TextSize = 8 h.LayoutOrder = 6 h.Parent = MiscPage end
+    local SpamHeadBtn = createToggle(MiscPage, "🤪 SPAM HEAD/BLINK", C_PURPLE, 5)
+    local HeadInBodyBtn = createToggle(MiscPage, "💀 HEAD IN BODY", C_PURPLE, 6)
 
     -- ============ PAGE: KEYBINDS ============
     local BindPage = Instance.new("Frame")
@@ -2214,25 +2230,6 @@ do
         end
     end)
 
-    SetBinBtn.MouseButton1Click:Connect(function()
-        local hrp = S.getHRP()
-        if hrp then
-            S.trashBinPos = hrp.Position
-            TrashBinLabel.Text = "Bin: " .. math.floor(S.trashBinPos.X) .. ", " .. math.floor(S.trashBinPos.Y) .. ", " .. math.floor(S.trashBinPos.Z)
-            S.sendNotif("Bin position set!")
-            SetBinBtn.Text = "📍 BIN POS SET ✓"
-        end
-    end)
-
-    SpamHeadBtn.MouseButton1Click:Connect(function()
-        S.toggleSpamHead(not S.isSpammingHead)
-        if S.isSpammingHead then
-            SpamHeadBtn.Text = "🤪 SPAM HEAD: ON" SpamHeadBtn.BackgroundColor3 = C_RED
-        else
-            SpamHeadBtn.Text = "🤪 SPAM HEAD/BLINK" SpamHeadBtn.BackgroundColor3 = C_PURPLE
-        end
-    end)
-
     -- ============ ARM WRESTLE BUTTONS ============
     AwAutoBtn.MouseButton1Click:Connect(function()
         S.awAutoEnabled = not S.awAutoEnabled
@@ -2357,175 +2354,40 @@ do
         end
     end)
 
-    -- ============ INFINITE HUNGER/THIRST ============
+    -- ============ INF HUNGER/THIRST (VISUAL ONLY) ============
+    -- Hunger/Thirst are Player Attributes (server-authoritative).
+    -- SetAttribute only works visually on client — bars stay full,
+    -- but server still tracks real hunger/thirst.
+    -- Use value_dumper.lua to find the real server-side mechanism.
+    --=============================================================
     do
-        local foundHungerValues = {}  -- cached after dump
-
-        function S.dumpGameValues()
-            foundHungerValues = {}
-            print("========================================")
-            print("[AI DUMP] Scanning game for ALL values...")
-            print("========================================")
-
-            -- 1. PlayerGui
-            pcall(function()
-                local pg = S.LocalPlayer:FindFirstChild("PlayerGui")
-                if pg then
-                    print("[AI DUMP] === PlayerGui ===")
-                    for _, desc in ipairs(pg:GetDescendants()) do
-                        if desc:IsA("NumberValue") or desc:IsA("IntValue") or desc:IsA("FloatValue") or desc:IsA("DoubleConstrainedValue") then
-                            print("[AI DUMP]   " .. desc:GetFullName() .. " = " .. tostring(desc.Value))
-                        end
-                    end
-                    -- Attributes on PlayerGui elements
-                    for _, desc in ipairs(pg:GetDescendants()) do
-                        local attrs = desc:GetAttributes()
-                        if next(attrs) then
-                            for k, v in pairs(attrs) do
-                                if type(v) == "number" then
-                                    print("[AI DUMP]   ATTR " .. desc:GetFullName() .. " ." .. k .. " = " .. tostring(v))
-                                end
-                            end
-                        end
-                    end
-                end
-            end)
-
-            -- 2. Character
-            pcall(function()
-                local char = S.getCharacter()
-                if char then
-                    print("[AI DUMP] === Character ===")
-                    for _, desc in ipairs(char:GetDescendants()) do
-                        if desc:IsA("NumberValue") or desc:IsA("IntValue") or desc:IsA("FloatValue") or desc:IsA("DoubleConstrainedValue") then
-                            print("[AI DUMP]   " .. desc:GetFullName() .. " = " .. tostring(desc.Value))
-                            table.insert(foundHungerValues, desc)
-                        end
-                    end
-                    -- Humanoid attributes
-                    local hum = char:FindFirstChildOfClass("Humanoid")
-                    if hum then
-                        local attrs = hum:GetAttributes()
-                        if next(attrs) then
-                            print("[AI DUMP] === Humanoid Attributes ===")
-                            for k, v in pairs(attrs) do
-                                print("[AI DUMP]   Humanoid." .. k .. " = " .. tostring(v))
-                            end
-                        end
-                    end
-                    -- Attributes on all parts
-                    for _, desc in ipairs(char:GetDescendants()) do
-                        local attrs = desc:GetAttributes()
-                        if next(attrs) then
-                            for k, v in pairs(attrs) do
-                                if type(v) == "number" then
-                                    print("[AI DUMP]   ATTR " .. desc:GetFullName() .. " ." .. k .. " = " .. tostring(v))
-                                end
-                            end
-                        end
-                    end
-                end
-            end)
-
-            -- 3. Player
-            pcall(function()
-                print("[AI DUMP] === Player ===")
-                for _, desc in ipairs(S.LocalPlayer:GetDescendants()) do
-                    if desc:IsA("NumberValue") or desc:IsA("IntValue") or desc:IsA("FloatValue") or desc:IsA("DoubleConstrainedValue") then
-                        print("[AI DUMP]   " .. desc:GetFullName() .. " = " .. tostring(desc.Value))
-                        table.insert(foundHungerValues, desc)
-                    end
-                end
-                local attrs = S.LocalPlayer:GetAttributes()
-                if next(attrs) then
-                    for k, v in pairs(attrs) do
-                        print("[AI DUMP]   Player ATTR ." .. k .. " = " .. tostring(v))
-                    end
-                end
-            end)
-
-            -- 4. ReplicatedStorage
-            pcall(function()
-                print("[AI DUMP] === ReplicatedStorage (top 2 levels) ===")
-                for _, child in ipairs(S.ReplicatedStorage:GetChildren()) do
-                    print("[AI DUMP]   " .. child.Name .. " (" .. child.ClassName .. ")")
-                    for _, desc in ipairs(child:GetChildren()) do
-                        if desc:IsA("NumberValue") or desc:IsA("IntValue") or desc:IsA("FloatValue") then
-                            print("[AI DUMP]     " .. desc.Name .. " = " .. tostring(desc.Value))
-                        end
-                        if desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction") then
-                            print("[AI DUMP]     REMOTE: " .. desc.Name)
-                        end
-                    end
-                end
-            end)
-
-            -- 5. Workspace > Tasks (game task objects)
-            pcall(function()
-                local tasks = S.Workspace:FindFirstChild("Tasks")
-                if tasks then
-                    print("[AI DUMP] === Workspace > Tasks ===")
-                    for _, child in ipairs(tasks:GetChildren()) do
-                        print("[AI DUMP]   " .. child.Name)
-                    end
-                end
-            end)
-
-            print("========================================")
-            print("[AI DUMP] Done! Check F9 console.")
-            print("[AI DUMP] Found " .. #foundHungerValues .. " numeric values total.")
-            print("========================================")
-        end
-
         function S.toggleInfiniteHunger(enable)
             if enable then
                 S.isInfiniteHunger = true
                 if S.hungerConn then S.hungerConn:Disconnect() end
 
-                -- Auto-find Hunger/Thirst values every frame and max them
                 S.hungerConn = S.RunService.Heartbeat:Connect(function()
                     if not S.isInfiniteHunger then return end
                     pcall(function()
-                        -- Method 1: Search Player descendants for named values
-                        for _, desc in ipairs(S.LocalPlayer:GetDescendants()) do
-                            if (desc:IsA("NumberValue") or desc:IsA("IntValue") or desc:IsA("FloatValue"))
-                                and (desc.Name:lower():find("hunger") or desc.Name:lower():find("thirst") or desc.Name:lower():find("food") or desc.Name:lower():find("water")) then
-                                pcall(function() desc.Value = 100 end)
-                            end
+                        local hunger = S.LocalPlayer:GetAttribute("Hunger")
+                        if hunger and hunger < 100 then
+                            S.LocalPlayer:SetAttribute("Hunger", 100)
                         end
-                        -- Method 2: Search Character descendants
-                        local char = S.getCharacter()
-                        if char then
-                            for _, desc in ipairs(char:GetDescendants()) do
-                                if (desc:IsA("NumberValue") or desc:IsA("IntValue") or desc:IsA("FloatValue"))
-                                    and (desc.Name:lower():find("hunger") or desc.Name:lower():find("thirst") or desc.Name:lower():find("food") or desc.Name:lower():find("water")) then
-                                    pcall(function() desc.Value = 100 end)
-                                end
-                            end
-                            -- Method 3: Humanoid attributes
-                            local hum = char:FindFirstChildOfClass("Humanoid")
-                            if hum then
-                                for k, v in pairs(hum:GetAttributes()) do
-                                    if type(v) == "number" and (k:lower():find("hunger") or k:lower():find("thirst") or k:lower():find("food") or k:lower():find("water")) then
-                                        pcall(function() hum:SetAttribute(k, 100) end)
-                                    end
-                                end
-                            end
-                        end
-                        -- Method 4: Also use any cached values from dump
-                        for _, v in ipairs(foundHungerValues) do
-                            if v and v.Parent then
-                                pcall(function() v.Value = 100 end)
-                            end
+                        local thirst = S.LocalPlayer:GetAttribute("Thirst")
+                        if thirst and thirst < 100 then
+                            S.LocalPlayer:SetAttribute("Thirst", 100)
                         end
                     end)
                 end)
+
+                S.sendNotif("Inf Hunger/Thirst: ON (visual only)")
             else
                 S.isInfiniteHunger = false
                 if S.hungerConn then
                     S.hungerConn:Disconnect()
                     S.hungerConn = nil
                 end
+                S.sendNotif("Inf Hunger/Thirst: OFF")
             end
         end
     end
@@ -2558,16 +2420,27 @@ do
         S.toggleInfiniteHunger(not S.isInfiniteHunger)
         if S.isInfiniteHunger then
             HungerBtn.Text = "🍖 INF HUNGER/THIRST: ON" HungerBtn.BackgroundColor3 = C_GREEN
-            S.sendNotif("Inf Hunger/Thirst: ON")
         else
             HungerBtn.Text = "🍖 INF HUNGER/THIRST: OFF" HungerBtn.BackgroundColor3 = C_RED
-            S.sendNotif("Inf Hunger/Thirst: OFF")
         end
     end)
 
-    DumpBtn.MouseButton1Click:Connect(function()
-        S.dumpGameValues()
-        S.sendNotif("Dumped! Check F9 console")
+    SpamHeadBtn.MouseButton1Click:Connect(function()
+        S.toggleSpamHead(not S.isSpammingHead)
+        if S.isSpammingHead then
+            SpamHeadBtn.Text = "🤪 SPAM HEAD: ON" SpamHeadBtn.BackgroundColor3 = C_RED
+        else
+            SpamHeadBtn.Text = "🤪 SPAM HEAD/BLINK" SpamHeadBtn.BackgroundColor3 = C_PURPLE
+        end
+    end)
+
+    HeadInBodyBtn.MouseButton1Click:Connect(function()
+        S.toggleHeadInBody(not S.isHeadInBody)
+        if S.isHeadInBody then
+            HeadInBodyBtn.Text = "💀 HEAD IN BODY: ON" HeadInBodyBtn.BackgroundColor3 = C_RED
+        else
+            HeadInBodyBtn.Text = "💀 HEAD IN BODY" HeadInBodyBtn.BackgroundColor3 = C_PURPLE
+        end
     end)
 
     -- ============ KEYBIND BUTTONS ============
